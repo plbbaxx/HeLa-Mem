@@ -8,6 +8,7 @@ class V5Test(unittest.TestCase):
         self.assertFalse(parse_base_claims('{"claims":[]}',["1"])[0]["answer_relevant"])
         recovered=parse_base_claims('{"claims":[{"memory_id":"9","answer_relevant":false,"slot":null,"value":null},{"memory_id":"1","answer_relevant":true,"slot":"place","value":"conference"},{"memory_id":"1","answer_relevant":true,"slot":"date","value":"Monday"}]}',["1"])
         self.assertEqual(recovered[0]["value"],"conference")
+        self.assertFalse(parse_candidate_claim('{"answer_relevant":true,"slot":"place"}')["answer_relevant"])
     def test_alignment_requires_valid_base_for_redundancy(self):
         parsed=parse_alignment('{"label":"REDUNDANT","matched_base_memory_id":"1","matched_slot":"place","reason":"same place"}',["1"])
         self.assertEqual(parsed["label"],"REDUNDANT")

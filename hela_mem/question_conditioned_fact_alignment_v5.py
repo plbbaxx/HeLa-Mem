@@ -144,17 +144,18 @@ def _json(text: str) -> Any:
 
 
 def _claim(value: Dict[str, Any], needs_memory_id: bool) -> Dict[str, Any]:
-    required = {"answer_relevant", "slot", "value"} | ({"memory_id"} if needs_memory_id else set())
-    if not isinstance(value, dict) or set(value) != required or not isinstance(value["answer_relevant"], bool):
-        raise ValueError("claim has invalid fields")
-    if needs_memory_id and (not isinstance(value["memory_id"], str) or not value["memory_id"].strip()):
+    if not isinstance(value, dict):
+        raise ValueError("claim must be an object")
+    if needs_memory_id and (not isinstance(value.get("memory_id"), str) or not value["memory_id"].strip()):
         raise ValueError("claim requires memory_id")
-    relevant = value["answer_relevant"]
-    if relevant and (not isinstance(value["slot"], str) or not value["slot"].strip() or not isinstance(value["value"], str) or not value["value"].strip()):
-        raise ValueError("relevant claim requires nonempty slot and value")
-    if not relevant and (value["slot"] is not None or value["value"] is not None):
-        raise ValueError("irrelevant claim requires null slot and value")
-    result = {"answer_relevant": relevant, "slot": value["slot"].strip() if relevant else None, "value": value["value"].strip() if relevant else None}
+    # Do not let optional explanations, omitted nulls, or incomplete claims
+    # terminate a long run.  A claim is usable only when the model explicitly
+    # marks it relevant *and* provides both factual fields; otherwise safely
+    # downgrade it to irrelevant rather than inventing a slot or value.
+    relevant = value.get("answer_relevant") is True
+    slot, factual_value = value.get("slot"), value.get("value")
+    usable = relevant and isinstance(slot, str) and slot.strip() and isinstance(factual_value, str) and factual_value.strip()
+    result = {"answer_relevant": bool(usable), "slot": slot.strip() if usable else None, "value": factual_value.strip() if usable else None}
     if needs_memory_id: result["memory_id"] = value["memory_id"].strip()
     return result
 
@@ -163,7 +164,14 @@ def parse_base_claims(text: str, expected_ids: Iterable[str]) -> List[Dict[str, 
     value = _json(text)
     if not isinstance(value, dict) or set(value) != {"claims"} or not isinstance(value["claims"], list):
         raise ValueError("base output must be {claims: [...]}")
-    claims = [_claim(row, True) for row in value["claims"]]
+    claims = []
+    for row in value["claims"]:
+        try:
+            claims.append(_claim(row, True))
+        except ValueError:
+            # An entry without a verifiable memory ID cannot be grounded and is
+            # ignored; the real Base memory will be restored as irrelevant.
+            continue
     ordered_ids, expected = [str(x) for x in expected_ids], {str(x) for x in expected_ids}
     # A small model occasionally repeats an ID or emits an invented ID despite
     # the prompt.  Such a claim cannot be safely grounded in the Base context,
@@ -184,7 +192,10 @@ def parse_base_claims(text: str, expected_ids: Iterable[str]) -> List[Dict[str, 
 
 
 def parse_candidate_claim(text: str) -> Dict[str, Any]:
-    return _claim(_json(text), False)
+    try:
+        return _claim(_json(text), False)
+    except ValueError:
+        return {"answer_relevant": False, "slot": None, "value": None}
 
 
 def parse_alignment(text: str, valid_base_ids: Iterable[str]) -> Dict[str, Any]:
