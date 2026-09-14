@@ -17,6 +17,7 @@ if not hasattr(__import__("openai"), "OpenAI"):
 
 from hela_mem import encode_longmemeval as enc
 from hela_mem import eval_longmemeval as ev
+from hela_mem.hebbian_memory import apply_redundancy_aware_inhibition
 
 
 class FakeExtractionClient:
@@ -48,6 +49,20 @@ def item(index):
 
 
 class ReproPipelineTest(unittest.TestCase):
+    def test_redundancy_aware_inhibition_changes_competitive_ranking(self):
+        scores = np.array([0.82, 0.78, 0.72, 0.68])
+        embeddings = np.array([
+            [1.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.0],
+        ])
+        inhibited, penalties = apply_redundancy_aware_inhibition(
+            scores, embeddings, gamma=0.3
+        )
+        self.assertEqual(np.argsort(inhibited)[::-1].tolist(), [0, 2, 1, 3])
+        self.assertGreater(penalties[1], penalties[2])
+
     def test_five_items_resume_and_eval_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

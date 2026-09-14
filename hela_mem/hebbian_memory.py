@@ -4,6 +4,32 @@ import os
 from collections import defaultdict
 from .utils import get_timestamp, get_embedding, normalize_vector, compute_time_decay, llm_extract_keywords
 
+
+def apply_redundancy_aware_inhibition(activation_scores, embeddings, gamma=0.2):
+    """Suppress weaker, semantically redundant candidates.
+
+    Adapted for HeLa-Mem from the lateral-inhibition principle: unlike generic
+    activation-only inhibition, competition is memory-specific and weighted by
+    positive cosine similarity. This is not a reproduction of SYNAPSE retrieval.
+    """
+    scores = np.asarray(activation_scores, dtype=float)
+    vectors = np.asarray(embeddings, dtype=float)
+    if scores.ndim != 1:
+        raise ValueError("activation_scores must be one-dimensional")
+    if vectors.ndim != 2 or vectors.shape[0] != scores.shape[0]:
+        raise ValueError("embeddings must contain one vector per score")
+    if gamma < 0:
+        raise ValueError("gamma must be non-negative")
+    if scores.size == 0 or gamma == 0:
+        return scores.copy(), np.zeros_like(scores)
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    normalized = np.divide(vectors, norms, out=np.zeros_like(vectors), where=norms > 0)
+    similarities = np.maximum(0.0, normalized @ normalized.T)
+    stronger_mask = scores[None, :] > scores[:, None]
+    penalties = (stronger_mask * similarities * scores[None, :]).sum(axis=1)
+    return scores - gamma * penalties, penalties
+
 class HebbianMemoryGraph:
     def __init__(self, file_path, embedding_dim=384):
         self.file_path = file_path
@@ -23,6 +49,9 @@ class HebbianMemoryGraph:
         self.activation_alpha = float(os.environ.get("HEBBIAN_ACTIVATION_ALPHA", 0.1))
         self.spreading_threshold = float(os.environ.get("HEBBIAN_SPREADING_THRESHOLD", 0.4))
         self.max_flipped = int(os.environ.get("HEBBIAN_MAX_FLIPPED", 5))  # [NEW] Standalone hebbian bonus
+        self.use_redundancy_inhibition = os.environ.get("HEBBIAN_USE_REDUNDANCY_INHIBITION", "false").lower() == "true"
+        self.inhibition_gamma = float(os.environ.get("HEBBIAN_INHIBITION_GAMMA", "0.2"))
+        self.last_retrieval_trace = None
         
         print(f"[Hebbian] Initialized with: LR={self.learning_rate}, Decay={self.decay_rate}, Alpha={self.activation_alpha}, Threshold={self.spreading_threshold}, MaxFlipped={self.max_flipped}")
         
@@ -196,7 +225,7 @@ class HebbianMemoryGraph:
     #         
     #     return results
 
-    def retrieve(self, query, top_k=5, override_max_flipped=None):
+    def retrieve(self, query, top_k=5, override_max_flipped=None, use_inhibition_override=None):
         """
         [NEW] Hebbian Retrieval: Vector Similarity + Spreading Activation + Time Decay + Keyword Matching
         Improvements:
@@ -324,14 +353,61 @@ class HebbianMemoryGraph:
         
         # Spreading pathway: Find flipped entries (not in base top-K, not in base selection)
         # ONLY look within the natural Top-K of spreading ranking!
+        spreading_top_k = spreading_ranking[:top_k]
+        candidate_indices_before = [
+            idx for idx in spreading_top_k
+            if idx not in top_indices_no_spreading and idx not in base_indices_set
+        ]
+        candidate_indices_after = list(candidate_indices_before)
+        flipped_before = candidate_indices_before[:max_flipped] if max_flipped > 0 else []
+        inhibition_enabled = (
+            self.use_redundancy_inhibition
+            if use_inhibition_override is None
+            else bool(use_inhibition_override)
+        )
+        inhibited_scores = final_scores.copy()
+        candidate_penalties = np.zeros(len(candidate_indices_before), dtype=float)
+        if inhibition_enabled and candidate_indices_before:
+            candidate_scores = final_scores[candidate_indices_before]
+            candidate_embeddings = node_matrix[candidate_indices_before]
+            candidate_new_scores, candidate_penalties = apply_redundancy_aware_inhibition(
+                candidate_scores,
+                candidate_embeddings,
+                gamma=self.inhibition_gamma,
+            )
+            inhibited_scores[candidate_indices_before] = candidate_new_scores
+            candidate_indices_after = [
+                candidate_indices_before[pos]
+                for pos in np.argsort(candidate_new_scores)[::-1]
+            ]
+
         flipped_indices = []
         if max_flipped > 0:
-            spreading_top_k = spreading_ranking[:top_k]
-            for idx in spreading_top_k:
-                if idx not in top_indices_no_spreading and idx not in base_indices_set:
-                    flipped_indices.append(idx)
-                    if len(flipped_indices) >= max_flipped:
-                        break
+            flipped_indices = candidate_indices_after[:max_flipped]
+
+        rank_after = list(spreading_ranking)
+        candidate_set = set(candidate_indices_before)
+        candidate_positions = [
+            pos for pos, idx in enumerate(rank_after) if idx in candidate_set
+        ]
+        for pos, idx in zip(candidate_positions, candidate_indices_after):
+            rank_after[pos] = idx
+
+        self.last_retrieval_trace = {
+            "use_redundancy_inhibition": inhibition_enabled,
+            "inhibition_gamma": self.inhibition_gamma,
+            "node_ids": node_ids,
+            "final_scores": final_scores.astype(float).tolist(),
+            "inhibited_scores": inhibited_scores.astype(float).tolist(),
+            "rank_before": [node_ids[idx] for idx in spreading_ranking],
+            "rank_after": [node_ids[idx] for idx in rank_after],
+            "base_top_k_ids": [node_ids[idx] for idx in base_indices],
+            "candidate_memory_ids_before": [node_ids[idx] for idx in candidate_indices_before],
+            "candidate_memory_ids_after": [node_ids[idx] for idx in candidate_indices_after],
+            "candidate_penalties": candidate_penalties.astype(float).tolist(),
+            "flipped_memory_ids_before": [node_ids[idx] for idx in flipped_before],
+            "flipped_memory_ids_after": [node_ids[idx] for idx in flipped_indices],
+        }
         
         # Combine: Base + Flipped (no fill-up)
         top_indices = base_indices + flipped_indices
@@ -360,7 +436,7 @@ class HebbianMemoryGraph:
         for idx in flipped_indices:
             nid = node_ids[idx]
             node = self.nodes[nid]
-            score = final_scores[idx]
+            score = inhibited_scores[idx]
             recency = compute_time_decay(node["timestamp"], current_time)
             
             results.append({

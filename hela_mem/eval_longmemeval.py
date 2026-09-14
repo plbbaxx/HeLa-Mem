@@ -548,6 +548,7 @@ def evaluate_single_item(
         "num_retrieved": len(retrieved),
         "retrieved_episodic": compact_retrieval(retrieved),
         "retrieved_semantic": [{key: value for key, value in entry.items() if key != "knowledge_embedding"} for entry in semantic_retrieved],
+        "redundancy_inhibition_trace": memory_graph.last_retrieval_trace,
         "model": model_for("generation"),
         "judge_model": model_for("judge"),
         "status": "ok",
@@ -609,7 +610,9 @@ def eval_longmemeval(
     print(f"Workers: {workers}")
     print(f"Hebbian params: max_flipped={os.environ.get('HEBBIAN_MAX_FLIPPED', '5')}, "
           f"lr={os.environ.get('HEBBIAN_LEARNING_RATE', '0.02')}, "
-          f"alpha={os.environ.get('HEBBIAN_ACTIVATION_ALPHA', '0.1')}")
+          f"alpha={os.environ.get('HEBBIAN_ACTIVATION_ALPHA', '0.1')}, "
+          f"redundancy_inhibition={os.environ.get('HEBBIAN_USE_REDUNDANCY_INHIBITION', 'false')}, "
+          f"gamma={os.environ.get('HEBBIAN_INHIBITION_GAMMA', '0.2')}")
     print("=" * 70)
 
     # Load dataset
@@ -637,6 +640,8 @@ def eval_longmemeval(
         "top_k": top_k,
         "semantic_top_k": semantic_top_k,
         "use_consolidation": use_consolidation,
+        "use_redundancy_inhibition": os.environ.get("HEBBIAN_USE_REDUNDANCY_INHIBITION", "false").lower() == "true",
+        "inhibition_gamma": os.environ.get("HEBBIAN_INHIBITION_GAMMA", "0.2"),
     })
     for i, item in enumerate(items):
         result_path = os.path.join(results_dir, f"result_{item['question_id']}.json")
@@ -738,6 +743,8 @@ def eval_longmemeval(
             "decay_rate": os.environ.get("HEBBIAN_DECAY_RATE", "0.995"),
             "keyword_weight": os.environ.get("HEBBIAN_KEYWORD_WEIGHT", "0.5"),
             "tau": os.environ.get("HEBBIAN_TAU", "1e7"),
+            "use_redundancy_inhibition": os.environ.get("HEBBIAN_USE_REDUNDANCY_INHIBITION", "false").lower() == "true",
+            "inhibition_gamma": os.environ.get("HEBBIAN_INHIBITION_GAMMA", "0.2"),
             "generation_model": model_for("generation"),
             "judge_model": model_for("judge"),
         },
@@ -791,10 +798,14 @@ def main() -> None:
     parser.add_argument("--workers", "--concurrency", dest="workers", type=int, default=4, help="Parallel workers")
     parser.add_argument("--results_dir", default=None)
     parser.add_argument("--no_resume", action="store_true")
+    parser.add_argument("--use-redundancy-inhibition", action="store_true")
+    parser.add_argument("--inhibition-gamma", type=float, default=0.2)
 
     args = parser.parse_args()
 
     top_k = args.top_k or int(os.environ.get("HEBBIAN_TOP_K", "20"))
+    os.environ["HEBBIAN_USE_REDUNDANCY_INHIBITION"] = str(args.use_redundancy_inhibition).lower()
+    os.environ["HEBBIAN_INHIBITION_GAMMA"] = str(args.inhibition_gamma)
 
     eval_longmemeval(
         data_path=args.data_path,

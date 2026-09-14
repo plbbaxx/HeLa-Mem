@@ -101,7 +101,13 @@ class HebbianKnowledgeMemory:
         # Check if we have graph nodes
         if len(self.knowledge_graph.nodes) > 0:
             # 1. Retrieve from Graph with KB-specific max_flipped
-            hebbian_results = self.knowledge_graph.retrieve(query, top_k=top_k, override_max_flipped=self.kb_max_flipped)
+            # V2 inhibition is episodic-only; semantic memory must remain unchanged.
+            hebbian_results = self.knowledge_graph.retrieve(
+                query,
+                top_k=top_k,
+                override_max_flipped=self.kb_max_flipped,
+                use_inhibition_override=False,
+            )
             
             # 2. Format results to match expected interface
             results = []
