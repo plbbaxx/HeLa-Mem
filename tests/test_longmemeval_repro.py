@@ -84,6 +84,28 @@ class ReproPipelineTest(unittest.TestCase):
             self.assertEqual(trace["base_top_k_ids"], inhibited_trace["base_top_k_ids"])
             self.assertEqual(inhibited_trace["rank_before"], inhibited_trace["rank_after"])
 
+    def test_retrieval_probe_can_disable_reinforcement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            graph = HebbianMemoryGraph(str(Path(temp) / "memory.json"))
+            graph.nodes = {
+                "0": {"id": "0", "content": "a", "embedding": [1.0, 0.0], "timestamp": "2026-01-01", "keywords": []},
+                "1": {"id": "1", "content": "b", "embedding": [0.0, 1.0], "timestamp": "2026-01-01", "keywords": []},
+            }
+            graph.add_edge("0", "1", weight=0.5, bidirectional=True)
+            before = {source: dict(neighbors) for source, neighbors in graph.edges.items()}
+            with patch("hela_mem.hebbian_memory.compute_time_decay", lambda *args: 1.0):
+                graph.retrieve(
+                    "query", top_k=1,
+                    query_keywords_override=set(),
+                    query_embedding_override=np.array([1.0, 0.0]),
+                    current_time_override="2026-01-02 00:00:00",
+                    edge_weight_multipliers={("0", "1"): 2.0},
+                    reinforce=False,
+                )
+            self.assertEqual(before, {source: dict(neighbors) for source, neighbors in graph.edges.items()})
+            self.assertFalse(graph.last_retrieval_trace["reinforcement_enabled"])
+            self.assertTrue(graph.last_retrieval_trace["edge_weight_calibration_enabled"])
+
     def test_five_items_resume_and_eval_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

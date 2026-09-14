@@ -223,7 +223,17 @@ class HebbianMemoryGraph:
     #         
     #     return results
 
-    def retrieve(self, query, top_k=5, override_max_flipped=None):
+    def retrieve(
+        self,
+        query,
+        top_k=5,
+        override_max_flipped=None,
+        query_keywords_override=None,
+        query_embedding_override=None,
+        current_time_override=None,
+        edge_weight_multipliers=None,
+        reinforce=True,
+    ):
         """
         [NEW] Hebbian Retrieval: Vector Similarity + Spreading Activation + Time Decay + Keyword Matching
         Improvements:
@@ -247,13 +257,19 @@ class HebbianMemoryGraph:
         #         pass
 
         # Extract query keywords
-        try:
-            query_keywords = llm_extract_keywords(query)
-        except:
-            query_keywords = set()
+        if query_keywords_override is None:
+            try:
+                query_keywords = llm_extract_keywords(query)
+            except:
+                query_keywords = set()
+        else:
+            query_keywords = set(query_keywords_override)
 
         # 1. Base Activation (Vector Similarity)
-        query_vec = normalize_vector(get_embedding(query))
+        if query_embedding_override is None:
+            query_vec = normalize_vector(get_embedding(query))
+        else:
+            query_vec = normalize_vector(query_embedding_override)
         
         # Matrix operation for speed
         node_ids = list(self.nodes.keys())
@@ -267,7 +283,7 @@ class HebbianMemoryGraph:
         base_activations = (base_activations + 1) / 2.0 
 
         # Apply Time Decay and Keyword Matching to Base Activation
-        current_time = get_timestamp()
+        current_time = current_time_override or get_timestamp()
         enhanced_activations = np.zeros_like(base_activations)
         
         # Check if time decay and keyword matching are enabled
@@ -329,7 +345,10 @@ class HebbianMemoryGraph:
                         # - Source relevance (score)
                         # - Connection strength (weight)
                         # - Alpha parameter
-                        boost = score * weight * self.activation_alpha
+                        multiplier = 1.0
+                        if edge_weight_multipliers is not None:
+                            multiplier = float(edge_weight_multipliers.get((source_id, target_id), 1.0))
+                        boost = score * weight * multiplier * self.activation_alpha
                         final_scores[target_idx] += boost
 
         # 3. Dual-Pathway Ranking: Base (top_k) + Hebbian Bonus (max_flipped)
@@ -390,6 +409,9 @@ class HebbianMemoryGraph:
             "base_top_k_ids": [node_ids[idx] for idx in base_indices],
             "flipped_memory_ids_before": [node_ids[idx] for idx in flipped_before],
             "flipped_memory_ids_after": [node_ids[idx] for idx in flipped_indices],
+            "query_keywords": sorted(query_keywords),
+            "edge_weight_calibration_enabled": edge_weight_multipliers is not None,
+            "reinforcement_enabled": bool(reinforce),
         }
         
         # Combine: Base + Flipped (no fill-up)
@@ -436,7 +458,8 @@ class HebbianMemoryGraph:
             print(f"  [Spreading] {spreading_flipped_count}/{max_flipped} flipped added.")
             
         # 4. Hebbian Learning
-        self.reinforce_memory_cluster(retrieved_ids)
+        if reinforce:
+            self.reinforce_memory_cluster(retrieved_ids)
             
         return results
 
