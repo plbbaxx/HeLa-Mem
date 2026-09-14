@@ -26,6 +26,7 @@ python -m hela_mem.scan_oracle_edge_utility \
   --quality-report "$QUALITY_REPORT" \
   --output "$OUTPUT" \
   --embedding-model "$EMBEDDING_MODEL" \
+  --device cpu \
   --top-k 15 \
   --max-flipped 3 \
   --activation-alpha 0.1 \

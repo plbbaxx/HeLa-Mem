@@ -197,6 +197,7 @@ def main() -> None:
     parser.add_argument("--quality-report", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--embedding-model", default=os.environ.get("HEBBIAN_EMBEDDING_MODEL", "all-MiniLM-L6-v2"))
+    parser.add_argument("--device", default="cpu", help="Embedding device; CPU avoids competing with a running vLLM server")
     parser.add_argument("--top-k", type=int, default=15)
     parser.add_argument("--max-flipped", type=int, default=3)
     parser.add_argument("--activation-alpha", type=float, default=0.1)
@@ -214,7 +215,7 @@ def main() -> None:
     quality_labels = load_quality_labels(Path(args.quality_report))
     if {item["question_id"] for item in dataset} != set(predictions):
         raise SystemExit("dataset and baseline predictions must contain identical question IDs")
-    model = SentenceTransformer(args.embedding_model)
+    model = SentenceTransformer(args.embedding_model, device=args.device)
     query_embeddings = model.encode(
         [item["question"] for item in dataset], convert_to_numpy=True,
         normalize_embeddings=True, show_progress_bar=True,
@@ -239,7 +240,7 @@ def main() -> None:
         "protocol_caveat": "The original run did not persist full activation traces. This paired proxy omits keyword and time-decay terms and is not a baseline reproduction.",
         "data_path": args.data_path, "mem_dir": args.mem_dir,
         "base_predictions": args.base_predictions, "quality_report": args.quality_report,
-        "embedding_model": args.embedding_model,
+        "embedding_model": args.embedding_model, "embedding_device": args.device,
         "parameters": {"top_k": args.top_k, "max_flipped": args.max_flipped, "activation_alpha": args.activation_alpha, "spreading_threshold": args.spreading_threshold, "support_gain": args.support_gain, "redundant_alpha": args.redundant_alpha, "irrelevant_multiplier": 0.0, "uncertain_multiplier": 1.0},
         "summary": summarize(records, args.minimum_changed, args.minimum_supporting_share),
         "records": records,
