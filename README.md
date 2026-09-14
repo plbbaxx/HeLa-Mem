@@ -74,6 +74,48 @@ export OPENAI_API_KEYS_FILE="/path/to/keys.txt"
 
 The default model is `gpt-4o-mini`.
 
+## Local Qwen3-4B LongMemEval reproduction
+
+The LongMemEval pipeline has independent model controls so answer generation,
+memory extraction, and judging can be changed without coupling protocols:
+
+```bash
+export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
+export OPENAI_API_KEY="EMPTY"
+export HEBBIAN_GENERATION_MODEL="Qwen3-4B-Instruct-2507"
+export HEBBIAN_EXTRACTION_MODEL="Qwen3-4B-Instruct-2507"
+export HEBBIAN_JUDGE_MODEL="Qwen3-4B-Instruct-2507"
+export HEBBIAN_EMBEDDING_MODEL="all-MiniLM-L6-v2"
+```
+
+Start the single-GPU vLLM server (the path remains configurable):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/serve_qwen3_4b.sh
+```
+
+Run a resumable smoke test in a second shell:
+
+```bash
+bash scripts/run_longmemeval_qwen3_4b.sh --stage all --num-items 5 --concurrency 4
+```
+
+`--stage encode` and `--stage eval` can be run separately. Supported fixed run
+sizes are 1, 5, 20, 100, and 500; each writes to its own `run_N` directory.
+Completed question IDs are validated and skipped on rerun. Invalid partial
+records are retried. Failures are written to `errors.jsonl` and are not counted
+as wrong predictions.
+
+Each run produces `manifest.json`, `run_config.json`, `timing.json`,
+`llm_usage.json`, `predictions.jsonl`, `metrics.json`, per-item encoding state,
+per-item evaluation results, and the original memory graph files. The bundled
+LongMemEval-S file contains 500 unique items; the manifest records its SHA-256.
+
+For a pipeline-only smoke test it is acceptable to use Qwen3-4B as both answer
+model and judge, but this is recorded explicitly. Formal comparisons should set
+`HEBBIAN_JUDGE_MODEL` to the same independent judge protocol used by the
+comparison baseline.
+
 ## Dataset Format
 
 ### LongMemEval-S

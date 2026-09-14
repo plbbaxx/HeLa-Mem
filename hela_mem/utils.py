@@ -6,6 +6,8 @@ import threading
 import os
 import json
 
+from .runtime import chat_extra_body, embedding_model, llm_scope, model_for, record_llm_request, record_llm_usage, strip_reasoning
+
 # Process-level model cache
 _model_cache = {}
 _model_lock = threading.Lock()
@@ -72,10 +74,11 @@ def get_timestamp():
 def generate_id(prefix="id"):
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
-def get_embedding(text, model_name="all-MiniLM-L6-v2"):
+def get_embedding(text, model_name=None):
     """
     Thread-safe, process-safe embedding generation
     """
+    model_name = model_name or embedding_model()
     process_key = f"{os.getpid()}_{model_name}"
     
     if process_key not in _model_cache:
@@ -85,9 +88,6 @@ def get_embedding(text, model_name="all-MiniLM-L6-v2"):
                     from sentence_transformers import SentenceTransformer
                     import torch
 
-                    # Force CPU for stability in multiprocessing
-                    os.environ['CUDA_VISIBLE_DEVICES'] = ''
-                    
                     # Stagger model loading to prevent file system race conditions
                     import random
                     time.sleep(random.uniform(0.1, 5.0))
@@ -117,7 +117,7 @@ def normalize_vector(vec):
 def gpt_generate_answer(prompt, messages, client=None, model=None):
     # Use model from environment if not specified
     if model is None:
-        model = os.environ.get('HEBBIAN_MODEL', 'gpt-4o-mini')
+        model = model_for("generation")
     # Use rotated API key for each call to reduce rate limits
     if client is None:
         client = _create_client()
@@ -125,27 +125,30 @@ def gpt_generate_answer(prompt, messages, client=None, model=None):
     max_retries = 5
     for attempt in range(max_retries):
         try:
+            record_llm_request()
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2000
+                max_tokens=2000,
+                **chat_extra_body(),
             )
+            record_llm_usage(response)
             
             if not response or not response.choices:
                 print(f"GPT Warning: Empty response or no choices. Attempt {attempt+1}/{max_retries}")
                 time.sleep(2)
                 continue
                 
-            return response.choices[0].message.content.strip()
+            return strip_reasoning(response.choices[0].message.content)
             
         except Exception as e:
             print(f"GPT Error (Attempt {attempt+1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 * (attempt + 1))  # Exponential backoff
             else:
-                return ""
-    return ""
+                raise RuntimeError(f"LLM request failed after {max_retries} attempts: {e}") from e
+    raise RuntimeError("LLM request failed without a response")
 
 def compute_time_decay(timestamp_str, tau=None):
     """简单的时间衰减函数"""
@@ -183,37 +186,41 @@ def llm_extract_keywords(text, client=None):
         {"role": "user", "content": prompt}
     ]
     # print("调用 GPT 提取关键词...")
-    keywords_text = gpt_generate_answer(prompt, messages, client)
+    with llm_scope("keyword_extraction_calls"):
+        keywords_text = gpt_generate_answer(prompt, messages, client, model=model_for("extraction"))
     keywords = [w.strip() for w in keywords_text.split(",") if w.strip()]
     return set(keywords)
 
 
-def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=3):
+def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=3, role="generation"):
     """
     Generate answer using LLM with API key rotation.
     Thread-safe: creates a new client with rotated API key for each call.
     """
     # Use model from environment if not specified
     if model is None:
-        model = os.environ.get('HEBBIAN_MODEL', 'gpt-4o-mini')
+        model = model_for(role)
     
     client = _create_client()  # Gets next API key via rotation
     
     for attempt in range(max_retries):
         try:
+            record_llm_request()
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=2000
+                max_tokens=2000,
+                **chat_extra_body(),
             )
+            record_llm_usage(response)
             
             if not response or not response.choices:
                 print(f"GPT Warning: Empty response. Attempt {attempt+1}/{max_retries}")
                 time.sleep(2)
                 continue
                 
-            return response.choices[0].message.content.strip()
+            return strip_reasoning(response.choices[0].message.content)
             
         except Exception as e:
             error_str = str(e).lower()
@@ -225,5 +232,5 @@ def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=
                 if attempt < max_retries - 1:
                     time.sleep(2 * (attempt + 1))
                 else:
-                    return ""
-    return ""
+                    raise RuntimeError(f"LLM request failed after {max_retries} attempts: {e}") from e
+    raise RuntimeError("LLM request failed without a response")

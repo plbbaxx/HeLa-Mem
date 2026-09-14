@@ -18,6 +18,7 @@ import argparse
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 from .hebbian_memory import HebbianMemoryGraph
@@ -26,6 +27,7 @@ from .hebbian_knowledge_memory import HebbianKnowledgeMemory
 from .utils import (
     gpt_generate_answer_with_rotation,
 )
+from .runtime import append_jsonl, atomic_write_json, config_fingerprint, llm_scope, model_for, read_valid_json, sha256_file, usage_snapshot
 
 
 # ========== GPT Judge (from LongMemEval / LightMem) ==========
@@ -129,6 +131,20 @@ def parse_judge_response(response: Optional[str]) -> bool:
     if "no" in first_line:
         return False
     return False
+
+
+def compact_retrieval(results: list) -> list:
+    """Keep evidence useful for analysis without duplicating embedding vectors."""
+    compact = []
+    for result in results:
+        node = result.get("node", {})
+        compact.append({
+            "node_id": node.get("id"), "content": node.get("content", ""),
+            "timestamp": node.get("timestamp", ""), "score": result.get("score"),
+            "base_score": result.get("base_score"), "source": result.get("source"),
+            "flipped_by_spreading": result.get("flipped_by_spreading", False),
+        })
+    return compact
 
 
 # ========== Consolidation (same as NarrativeQA) ==========
@@ -247,7 +263,8 @@ def consolidate_memory(
         ]
 
         try:
-            result = gpt_generate_answer_with_rotation(prompt, messages)
+            with llm_scope("consolidation_calls"):
+                result = gpt_generate_answer_with_rotation(prompt, messages, role="extraction")
             if not result:
                 continue
             for line in result.strip().split("\n"):
@@ -334,7 +351,7 @@ def answer_question(
     knowledge_memory: Optional[HebbianKnowledgeMemory] = None,
     semantic_top_k: int = 5,
     item_id: str = "",
-) -> Tuple[str, list]:
+) -> Tuple[str, list, list]:
     """
     Answer a single LongMemEval question using Hebbian retrieval.
 
@@ -361,6 +378,7 @@ def answer_question(
 
     # 2. Semantic retrieval from Knowledge Memory
     knowledge_text = ""
+    kb_results = []
     if knowledge_memory:
         try:
             kb_results = knowledge_memory.search_knowledge(question, top_k=semantic_top_k)
@@ -400,8 +418,9 @@ def answer_question(
         {"role": "user", "content": user_prompt},
     ]
 
-    response = gpt_generate_answer_with_rotation(user_prompt, messages)
-    return response, results
+    with llm_scope("answer_generation_calls"):
+        response = gpt_generate_answer_with_rotation(user_prompt, messages, role="generation")
+    return response, results, kb_results
 
 
 # ========== Single Item Evaluation ==========
@@ -414,6 +433,7 @@ def evaluate_single_item(
     semantic_top_k: int = 5,
     use_consolidation: bool = False,
     results_dir: Optional[str] = None,
+    fingerprint: str = "",
 ) -> Dict[str, Any]:
     """
     Evaluate a single LongMemEval item.
@@ -440,42 +460,37 @@ def evaluate_single_item(
     # Check for corrupted samples
     if item_idx in CORRUPTED_INDICES:
         print(f"  [{item_idx}] {item_id} - CORRUPTED (skipped, marked incorrect)")
-        return {
+        result = {
             "question_id": item_id,
             "question_type": question_type,
+            "question": question,
             "correct": 0,
+            "prediction": "[CORRUPTED]",
             "generated_answer": "[CORRUPTED]",
+            "gold_answer": str(answer),
             "ground_truth": str(answer),
+            "judge_result": "corrupted_index",
+            "retrieved_episodic": [],
+            "retrieved_semantic": [],
+            "model": model_for("generation"),
+            "judge_model": model_for("judge"),
+            "status": "ok",
+            "config_fingerprint": fingerprint,
             "is_corrupted": True,
             "eval_time": 0.0,
         }
+        if results_dir:
+            atomic_write_json(os.path.join(results_dir, f"result_{item_id}.json"), result)
+        return result
 
     # Load memory graph
     mem_path = os.path.join(mem_dir, f"{item_id}_hebbian.json")
     if not os.path.exists(mem_path):
-        print(f"  [{item_idx}] {item_id} - Memory file not found: {mem_path}")
-        return {
-            "question_id": item_id,
-            "question_type": question_type,
-            "correct": 0,
-            "generated_answer": "[NO MEMORY]",
-            "ground_truth": str(answer),
-            "error": "memory file not found",
-            "eval_time": 0.0,
-        }
+        raise RuntimeError(f"encoding_failure: memory file not found: {mem_path}")
 
     memory_graph = HebbianMemoryGraph(file_path=mem_path)
     if not memory_graph.nodes:
-        print(f"  [{item_idx}] {item_id} - Empty memory graph")
-        return {
-            "question_id": item_id,
-            "question_type": question_type,
-            "correct": 0,
-            "generated_answer": "[EMPTY GRAPH]",
-            "ground_truth": str(answer),
-            "error": "empty graph",
-            "eval_time": 0.0,
-        }
+        raise RuntimeError("encoding_failure: empty memory graph")
 
     # Load knowledge memory
     kb_path = os.path.join(mem_dir, f"{item_id}_long_term.json")
@@ -490,19 +505,16 @@ def evaluate_single_item(
 
     # Generate answer
     try:
-        generated_answer, retrieved = answer_question(
-            retriever,
-            question,
-            question_date,
-            top_k=top_k,
-            knowledge_memory=knowledge_memory,
-            semantic_top_k=semantic_top_k,
-            item_id=item_id,
-        )
+        retrieval_started = time.perf_counter()
+        with llm_scope("other_calls", item_id):
+            generated_answer, retrieved, semantic_retrieved = answer_question(
+                retriever, question, question_date, top_k=top_k,
+                knowledge_memory=knowledge_memory, semantic_top_k=semantic_top_k,
+                item_id=item_id,
+            )
+        generation_seconds = time.perf_counter() - retrieval_started
     except Exception as e:
-        print(f"  [{item_idx}] {item_id} - Answer generation error: {e}")
-        generated_answer = ""
-        retrieved = []
+        raise RuntimeError(f"generation_failure: {e}") from e
 
     # Judge with GPT
     try:
@@ -511,12 +523,13 @@ def evaluate_single_item(
             abstention=is_abstention,
         )
         judge_messages = [{"role": "user", "content": judge_prompt}]
-        judge_response = gpt_generate_answer_with_rotation(judge_prompt, judge_messages)
+        judge_started = time.perf_counter()
+        with llm_scope("judge_calls", item_id):
+            judge_response = gpt_generate_answer_with_rotation(judge_prompt, judge_messages, role="judge")
         correct = 1 if parse_judge_response(judge_response) else 0
+        judge_seconds = time.perf_counter() - judge_started
     except Exception as e:
-        print(f"  [{item_idx}] {item_id} - Judge error: {e}")
-        correct = 0
-        judge_response = ""
+        raise RuntimeError(f"judge_failure: {e}") from e
 
     eval_time = time.time() - t_start
 
@@ -524,23 +537,34 @@ def evaluate_single_item(
         "question_id": item_id,
         "question_type": question_type,
         "question": question,
+        "gold_answer": str(answer),
         "ground_truth": str(answer),
+        "prediction": generated_answer,
         "generated_answer": generated_answer,
+        "judge_result": judge_response,
         "correct": correct,
         "is_abstention": is_abstention,
         "num_nodes": len(memory_graph.nodes),
         "num_retrieved": len(retrieved),
+        "retrieved_episodic": compact_retrieval(retrieved),
+        "retrieved_semantic": [{key: value for key, value in entry.items() if key != "knowledge_embedding"} for entry in semantic_retrieved],
+        "model": model_for("generation"),
+        "judge_model": model_for("judge"),
+        "status": "ok",
+        "config_fingerprint": fingerprint,
+        "generation_seconds": generation_seconds,
+        "judge_seconds": judge_seconds,
+        "llm_usage": usage_snapshot(item_id),
         "eval_time": eval_time,
     }
 
-    # Save per-item result
+    # Persist retrieval-induced Hebbian updates before marking evaluation complete.
+    memory_graph.save()
+
+    # Save per-item result last; this is the resume completion marker.
     if results_dir:
         result_path = os.path.join(results_dir, f"result_{item_id}.json")
-        with open(result_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-
-    # Save updated graph (Hebbian edges evolved during retrieval)
-    memory_graph.save()
+        atomic_write_json(result_path, result)
 
     status = "CORRECT" if correct else "WRONG"
     print(f"  [{item_idx}] {item_id} ({question_type}) -> {status} ({eval_time:.1f}s)")
@@ -559,6 +583,8 @@ def eval_longmemeval(
     semantic_top_k: int = 5,
     use_consolidation: bool = False,
     workers: int = 20,
+    results_dir: Optional[str] = None,
+    resume: bool = True,
 ) -> None:
     """
     Run LongMemEval-S evaluation on encoded Hebbian memories.
@@ -598,11 +624,30 @@ def eval_longmemeval(
     print(f"Evaluating items [{start_item}:{start_item + len(items)}]")
 
     # Create results directory
-    results_dir = os.path.join(mem_dir, "eval_results")
+    results_dir = results_dir or os.path.join(mem_dir, "eval_results")
     os.makedirs(results_dir, exist_ok=True)
 
     # Evaluate items in parallel
     all_results = []
+    pending = []
+    fingerprint = config_fingerprint({
+        "dataset_sha256": sha256_file(data_path),
+        "generation_model": model_for("generation"),
+        "judge_model": model_for("judge"),
+        "top_k": top_k,
+        "semantic_top_k": semantic_top_k,
+        "use_consolidation": use_consolidation,
+    })
+    for i, item in enumerate(items):
+        result_path = os.path.join(results_dir, f"result_{item['question_id']}.json")
+        cached = read_valid_json(result_path, ("question_id", "status", "prediction", "judge_result")) if resume else None
+        if cached and cached["status"] == "ok" and cached.get("config_fingerprint") == fingerprint:
+            all_results.append(cached)
+        else:
+            pending.append((i, item))
+    print(f"Evaluation resume: {len(all_results)} complete, {len(pending)} pending")
+    errors_path = Path(results_dir).parent / "errors.jsonl"
+    errors_path.touch(exist_ok=True)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_idx = {
@@ -615,8 +660,9 @@ def eval_longmemeval(
                 semantic_top_k,
                 use_consolidation,
                 results_dir,
+                fingerprint,
             ): start_item + i
-            for i, item in enumerate(items)
+            for i, item in pending
         }
 
         for future in as_completed(future_to_idx):
@@ -631,8 +677,10 @@ def eval_longmemeval(
                           f"({correct_so_far / len(all_results) * 100:.1f}%)\n")
             except Exception as e:
                 print(f"  [ERROR] Item {idx}: {e}")
-                import traceback
-                traceback.print_exc()
+                failed_item = items[idx - start_item] if start_item <= idx < start_item + len(items) else {}
+                message = str(e)
+                stage = message.split(":", 1)[0] if "_failure:" in message else "evaluation_failure"
+                append_jsonl(errors_path, {"timestamp": datetime.now().isoformat(), "stage": stage, "question_id": failed_item.get("question_id", "unknown"), "error_type": type(e).__name__, "message": message})
 
     # Sort results by question_id for consistency
     all_results.sort(key=lambda x: x["question_id"])
@@ -690,13 +738,27 @@ def eval_longmemeval(
             "decay_rate": os.environ.get("HEBBIAN_DECAY_RATE", "0.995"),
             "keyword_weight": os.environ.get("HEBBIAN_KEYWORD_WEIGHT", "0.5"),
             "tau": os.environ.get("HEBBIAN_TAU", "1e7"),
+            "generation_model": model_for("generation"),
+            "judge_model": model_for("judge"),
         },
         "results": all_results,
     }
 
     summary_path = os.path.join(results_dir, "eval_summary.json")
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    atomic_write_json(summary_path, summary)
+    predictions_path = Path(results_dir).parent / "predictions.jsonl"
+    predictions_path.unlink(missing_ok=True)
+    for result in all_results:
+        append_jsonl(predictions_path, result)
+    atomic_write_json(Path(results_dir).parent / "metrics.json", {key: summary[key] for key in ("total_items", "total_correct", "overall_accuracy", "per_type")})
+    run_dir = Path(results_dir).parent
+    eval_usage = usage_snapshot()
+    atomic_write_json(run_dir / "eval_llm_usage.json", eval_usage)
+    encode_usage = read_valid_json(run_dir / "encode_llm_usage.json") or {}
+    atomic_write_json(run_dir / "llm_usage.json", {"encode": encode_usage, "eval": eval_usage})
+    old_timing = read_valid_json(run_dir / "timing.json") or {}
+    eval_seconds = sum(float(result.get("eval_time", 0.0)) for result in all_results)
+    atomic_write_json(run_dir / "timing.json", old_timing | {"eval_time": eval_seconds, "total_time": float(old_timing.get("encode_time", 0.0)) + eval_seconds, "avg_eval_time_per_item": eval_seconds / max(len(all_results), 1)})
     print(f"Summary saved: {summary_path}")
 
 
@@ -726,7 +788,9 @@ def main() -> None:
         "--use_consolidation", action="store_true",
         help="Run consolidation before evaluation",
     )
-    parser.add_argument("--workers", type=int, default=20, help="Parallel workers")
+    parser.add_argument("--workers", "--concurrency", dest="workers", type=int, default=4, help="Parallel workers")
+    parser.add_argument("--results_dir", default=None)
+    parser.add_argument("--no_resume", action="store_true")
 
     args = parser.parse_args()
 
@@ -741,6 +805,8 @@ def main() -> None:
         semantic_top_k=args.semantic_top_k,
         use_consolidation=args.use_consolidation,
         workers=args.workers,
+        results_dir=args.results_dir,
+        resume=not args.no_resume,
     )
 
 

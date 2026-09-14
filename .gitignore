@@ -9,3 +9,7 @@ __pycache__/
 .env
 logs/
 results/
+artifacts/
+*.py[cod]
+.venv/
+.pytest_cache/

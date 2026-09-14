@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
-  "openai",
+  "openai>=1.0",
   "sentence-transformers",
   "torch",
 ]

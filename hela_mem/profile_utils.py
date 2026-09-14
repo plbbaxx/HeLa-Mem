@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from openai import OpenAI
 
+from .runtime import chat_extra_body, llm_scope, model_for, record_llm_request, record_llm_usage, strip_reasoning
+
 
 class OpenAIClient:
     def __init__(self, api_key, base_url=None):
@@ -11,19 +13,22 @@ class OpenAIClient:
         kwargs["base_url"] = base_url or "https://api.openai.com/v1"
         self.client = OpenAI(**kwargs)
 
-    def chat_completion(self, model, messages, temperature=0.7, max_tokens=2000):
+    def chat_completion(self, model=None, messages=None, temperature=0.7, max_tokens=2000):
+        record_llm_request()
         response = self.client.chat.completions.create(
-            model=model,
+            model=model or model_for("extraction"),
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            **chat_extra_body(),
         )
-        return response.choices[0].message.content.strip()
+        record_llm_usage(response)
+        return strip_reasoning(response.choices[0].message.content)
 
 
 def gpt_generate_answer(prompt, messages, client):
     del prompt
-    return client.chat_completion(model="gpt-4o-mini", messages=messages, temperature=0.7, max_tokens=2000)
+    return client.chat_completion(model=model_for("extraction"), messages=messages, temperature=0.7, max_tokens=2000)
 
 
 def analyze_assistant_knowledge(dialogs, client):
@@ -73,7 +78,8 @@ Conversation:
         {"role": "user", "content": prompt},
     ]
 
-    result = gpt_generate_answer(prompt, messages, client)
+    with llm_scope("knowledge_extraction_calls"):
+        result = gpt_generate_answer(prompt, messages, client)
     assistant_knowledge = result.replace("【Assistant Knowledge】", "").strip()
     return {"assistant_knowledge": assistant_knowledge}
 
@@ -123,7 +129,8 @@ Conversation:
         {"role": "user", "content": prompt},
     ]
 
-    result = gpt_generate_answer(prompt, messages, client)
+    with llm_scope("profile_extraction_calls"):
+        result = gpt_generate_answer(prompt, messages, client)
     profile, user_data = result.split("【User Data】") if "【User Data】" in result else (result, "None")
     assistant_knowledge_result = analyze_assistant_knowledge(dialogs, client)
 
@@ -174,4 +181,5 @@ The generated content should not exceed 1500 words
         {"role": "user", "content": prompt},
     ]
 
-    return gpt_generate_answer(prompt, messages, client)
+    with llm_scope("profile_merge_calls"):
+        return gpt_generate_answer(prompt, messages, client)
