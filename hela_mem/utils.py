@@ -6,7 +6,7 @@ import threading
 import os
 import json
 
-from .runtime import chat_extra_body, embedding_model, llm_scope, model_for, record_llm_request, record_llm_usage, strip_reasoning
+from .runtime import chat_extra_body, embedding_model, llm_scope, model_for, record_llm_request, record_llm_usage, strip_reasoning, temperature_for
 
 # Process-level model cache
 _model_cache = {}
@@ -114,7 +114,7 @@ def normalize_vector(vec):
     norm = np.linalg.norm(vec)
     return vec if norm == 0 else vec / norm
 
-def gpt_generate_answer(prompt, messages, client=None, model=None):
+def gpt_generate_answer(prompt, messages, client=None, model=None, role="generation"):
     # Use model from environment if not specified
     if model is None:
         model = model_for("generation")
@@ -129,7 +129,7 @@ def gpt_generate_answer(prompt, messages, client=None, model=None):
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.7,
+                temperature=temperature_for(role),
                 max_tokens=2000,
                 **chat_extra_body(),
             )
@@ -187,7 +187,9 @@ def llm_extract_keywords(text, client=None):
     ]
     # print("调用 GPT 提取关键词...")
     with llm_scope("keyword_extraction_calls"):
-        keywords_text = gpt_generate_answer(prompt, messages, client, model=model_for("extraction"))
+        keywords_text = gpt_generate_answer(
+            prompt, messages, client, model=model_for("extraction"), role="extraction"
+        )
     keywords = [w.strip() for w in keywords_text.split(",") if w.strip()]
     return set(keywords)
 
@@ -209,7 +211,7 @@ def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.7,
+                temperature=temperature_for(role),
                 max_tokens=2000,
                 **chat_extra_body(),
             )

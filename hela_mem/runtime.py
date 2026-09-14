@@ -36,6 +36,15 @@ def model_for(role: str) -> str:
     return os.environ.get(names[role], legacy)
 
 
+def temperature_for(role: str) -> float:
+    names = {
+        "generation": "HEBBIAN_GENERATION_TEMPERATURE",
+        "extraction": "HEBBIAN_EXTRACTION_TEMPERATURE",
+        "judge": "HEBBIAN_JUDGE_TEMPERATURE",
+    }
+    return float(os.environ.get(names[role], os.environ.get("HEBBIAN_TEMPERATURE", "0.7")))
+
+
 def embedding_model() -> str:
     return os.environ.get("HEBBIAN_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 

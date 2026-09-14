@@ -107,6 +107,7 @@ class HebbianKnowledgeMemory:
                 top_k=top_k,
                 override_max_flipped=self.kb_max_flipped,
                 use_inhibition_override=False,
+                use_preselection_override=False,
             )
             
             # 2. Format results to match expected interface

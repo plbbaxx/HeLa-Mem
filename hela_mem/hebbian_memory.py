@@ -50,6 +50,7 @@ class HebbianMemoryGraph:
         self.spreading_threshold = float(os.environ.get("HEBBIAN_SPREADING_THRESHOLD", 0.4))
         self.max_flipped = int(os.environ.get("HEBBIAN_MAX_FLIPPED", 5))  # [NEW] Standalone hebbian bonus
         self.use_redundancy_inhibition = os.environ.get("HEBBIAN_USE_REDUNDANCY_INHIBITION", "false").lower() == "true"
+        self.use_preselection_pool = os.environ.get("HEBBIAN_USE_PRESELECTION_POOL", "false").lower() == "true"
         self.inhibition_gamma = float(os.environ.get("HEBBIAN_INHIBITION_GAMMA", "0.2"))
         self.last_retrieval_trace = None
         
@@ -225,7 +226,14 @@ class HebbianMemoryGraph:
     #         
     #     return results
 
-    def retrieve(self, query, top_k=5, override_max_flipped=None, use_inhibition_override=None):
+    def retrieve(
+        self,
+        query,
+        top_k=5,
+        override_max_flipped=None,
+        use_inhibition_override=None,
+        use_preselection_override=None,
+    ):
         """
         [NEW] Hebbian Retrieval: Vector Similarity + Spreading Activation + Time Decay + Keyword Matching
         Improvements:
@@ -354,10 +362,23 @@ class HebbianMemoryGraph:
         # Spreading pathway: Find flipped entries (not in base top-K, not in base selection)
         # ONLY look within the natural Top-K of spreading ranking!
         spreading_top_k = spreading_ranking[:top_k]
-        candidate_indices_before = [
+        postselection_candidates = [
             idx for idx in spreading_top_k
             if idx not in top_indices_no_spreading and idx not in base_indices_set
         ]
+        preselection_enabled = (
+            self.use_preselection_pool
+            if use_preselection_override is None
+            else bool(use_preselection_override)
+        )
+        spread_boosts = final_scores - enhanced_activations
+        if preselection_enabled:
+            candidate_indices_before = [
+                idx for idx in spreading_ranking
+                if idx not in base_indices_set and spread_boosts[idx] > 1e-12
+            ]
+        else:
+            candidate_indices_before = postselection_candidates
         candidate_indices_after = list(candidate_indices_before)
         flipped_before = candidate_indices_before[:max_flipped] if max_flipped > 0 else []
         inhibition_enabled = (
@@ -395,9 +416,11 @@ class HebbianMemoryGraph:
 
         self.last_retrieval_trace = {
             "use_redundancy_inhibition": inhibition_enabled,
+            "use_preselection_pool": preselection_enabled,
             "inhibition_gamma": self.inhibition_gamma,
             "node_ids": node_ids,
             "final_scores": final_scores.astype(float).tolist(),
+            "spread_boosts": spread_boosts.astype(float).tolist(),
             "inhibited_scores": inhibited_scores.astype(float).tolist(),
             "rank_before": [node_ids[idx] for idx in spreading_ranking],
             "rank_after": [node_ids[idx] for idx in rank_after],

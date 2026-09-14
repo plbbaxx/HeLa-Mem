@@ -17,7 +17,8 @@ if not hasattr(__import__("openai"), "OpenAI"):
 
 from hela_mem import encode_longmemeval as enc
 from hela_mem import eval_longmemeval as ev
-from hela_mem.hebbian_memory import apply_redundancy_aware_inhibition
+from hela_mem.hebbian_memory import HebbianMemoryGraph, apply_redundancy_aware_inhibition
+from hela_mem.runtime import temperature_for
 
 
 class FakeExtractionClient:
@@ -49,6 +50,44 @@ def item(index):
 
 
 class ReproPipelineTest(unittest.TestCase):
+    def test_role_temperatures_can_be_made_deterministic(self):
+        with patch.dict("os.environ", {"HEBBIAN_TEMPERATURE": "0"}, clear=False):
+            self.assertEqual(temperature_for("extraction"), 0.0)
+            self.assertEqual(temperature_for("generation"), 0.0)
+            self.assertEqual(temperature_for("judge"), 0.0)
+
+    def test_preselection_pool_includes_all_boosted_non_base_nodes(self):
+        def make_graph(path):
+            graph = HebbianMemoryGraph(str(path))
+            graph.activation_alpha = 0.5
+            graph.spreading_threshold = 0.4
+            graph.max_flipped = 2
+            vectors = ([1.0, 0.0], [0.99, 0.1], [0.0, 1.0], [0.1, 0.99])
+            graph.nodes = {
+                str(i): {"id": str(i), "content": str(i), "embedding": vector, "timestamp": "2026-01-01", "keywords": []}
+                for i, vector in enumerate(vectors)
+            }
+            graph.add_edge("0", "2", weight=1.0, bidirectional=False)
+            graph.add_edge("0", "3", weight=0.4, bidirectional=False)
+            return graph
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("hela_mem.hebbian_memory.get_embedding", lambda text: np.array([1.0, 0.0])), \
+             patch("hela_mem.hebbian_memory.llm_extract_keywords", lambda text: set()), \
+             patch("hela_mem.hebbian_memory.compute_time_decay", lambda *args: 1.0):
+            baseline = make_graph(Path(temp) / "baseline.json")
+            baseline.use_preselection_pool = False
+            baseline.retrieve("query", top_k=2)
+            preselection = make_graph(Path(temp) / "preselection.json")
+            preselection.use_preselection_pool = True
+            preselection.retrieve("query", top_k=2)
+        self.assertEqual(len(baseline.last_retrieval_trace["candidate_memory_ids_before"]), 1)
+        self.assertEqual(set(preselection.last_retrieval_trace["candidate_memory_ids_before"]), {"2", "3"})
+        self.assertEqual(
+            baseline.last_retrieval_trace["base_top_k_ids"],
+            preselection.last_retrieval_trace["base_top_k_ids"],
+        )
+
     def test_redundancy_aware_inhibition_changes_competitive_ranking(self):
         scores = np.array([0.82, 0.78, 0.72, 0.68])
         embeddings = np.array([

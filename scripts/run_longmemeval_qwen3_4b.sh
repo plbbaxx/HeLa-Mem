@@ -7,6 +7,7 @@ CONCURRENCY="4"
 ARTIFACT_ROOT="artifacts/longmemeval_qwen3_4b"
 DATA_PATH="data/longmemeval_s.json"
 USE_REDUNDANCY_INHIBITION="false"
+USE_PRESELECTION_POOL="false"
 INHIBITION_GAMMA="0.2"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -16,6 +17,7 @@ while [[ $# -gt 0 ]]; do
     --artifact-root) ARTIFACT_ROOT="$2"; shift 2 ;;
     --data-path) DATA_PATH="$2"; shift 2 ;;
     --use-redundancy-inhibition) USE_REDUNDANCY_INHIBITION="true"; shift ;;
+    --use-preselection-pool) USE_PRESELECTION_POOL="true"; shift ;;
     --inhibition-gamma) INHIBITION_GAMMA="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -47,6 +49,7 @@ export HEBBIAN_TOP_K="${HEBBIAN_TOP_K:-15}"
 export HEBBIAN_SEMANTIC_TOP_K="${HEBBIAN_SEMANTIC_TOP_K:-5}"
 export HEBBIAN_KNOWLEDGE_BUFFER_SIZE="${HEBBIAN_KNOWLEDGE_BUFFER_SIZE:-10}"
 export HEBBIAN_USE_REDUNDANCY_INHIBITION="$USE_REDUNDANCY_INHIBITION"
+export HEBBIAN_USE_PRESELECTION_POOL="$USE_PRESELECTION_POOL"
 export HEBBIAN_INHIBITION_GAMMA="$INHIBITION_GAMMA"
 
 if [[ "$STAGE" == "encode" || "$STAGE" == "all" ]]; then
@@ -60,10 +63,12 @@ if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
   if [[ "${HEBBIAN_USE_CONSOLIDATION:-false}" == "true" ]]; then CONSOLIDATION_ARGS+=(--use_consolidation); fi
   INHIBITION_ARGS=()
   if [[ "$USE_REDUNDANCY_INHIBITION" == "true" ]]; then INHIBITION_ARGS+=(--use-redundancy-inhibition); fi
+  PRESELECTION_ARGS=()
+  if [[ "$USE_PRESELECTION_POOL" == "true" ]]; then PRESELECTION_ARGS+=(--use-preselection-pool); fi
   python -m hela_mem.eval_longmemeval \
     --data_path "$DATA_PATH" --mem_dir "$ENCODED_DIR" --results_dir "$EVAL_DIR" \
     --num_items "$NUM_ITEMS" --concurrency "$CONCURRENCY" \
     --top_k "$HEBBIAN_TOP_K" --semantic_top_k "$HEBBIAN_SEMANTIC_TOP_K" \
-    --inhibition-gamma "$INHIBITION_GAMMA" "${INHIBITION_ARGS[@]}" \
+    --inhibition-gamma "$INHIBITION_GAMMA" "${PRESELECTION_ARGS[@]}" "${INHIBITION_ARGS[@]}" \
     "${CONSOLIDATION_ARGS[@]}"
 fi

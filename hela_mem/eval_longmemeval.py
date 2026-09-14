@@ -611,6 +611,7 @@ def eval_longmemeval(
     print(f"Hebbian params: max_flipped={os.environ.get('HEBBIAN_MAX_FLIPPED', '5')}, "
           f"lr={os.environ.get('HEBBIAN_LEARNING_RATE', '0.02')}, "
           f"alpha={os.environ.get('HEBBIAN_ACTIVATION_ALPHA', '0.1')}, "
+          f"preselection_pool={os.environ.get('HEBBIAN_USE_PRESELECTION_POOL', 'false')}, "
           f"redundancy_inhibition={os.environ.get('HEBBIAN_USE_REDUNDANCY_INHIBITION', 'false')}, "
           f"gamma={os.environ.get('HEBBIAN_INHIBITION_GAMMA', '0.2')}")
     print("=" * 70)
@@ -640,6 +641,7 @@ def eval_longmemeval(
         "top_k": top_k,
         "semantic_top_k": semantic_top_k,
         "use_consolidation": use_consolidation,
+        "use_preselection_pool": os.environ.get("HEBBIAN_USE_PRESELECTION_POOL", "false").lower() == "true",
         "use_redundancy_inhibition": os.environ.get("HEBBIAN_USE_REDUNDANCY_INHIBITION", "false").lower() == "true",
         "inhibition_gamma": os.environ.get("HEBBIAN_INHIBITION_GAMMA", "0.2"),
     })
@@ -743,8 +745,12 @@ def eval_longmemeval(
             "decay_rate": os.environ.get("HEBBIAN_DECAY_RATE", "0.995"),
             "keyword_weight": os.environ.get("HEBBIAN_KEYWORD_WEIGHT", "0.5"),
             "tau": os.environ.get("HEBBIAN_TAU", "1e7"),
+            "use_preselection_pool": os.environ.get("HEBBIAN_USE_PRESELECTION_POOL", "false").lower() == "true",
             "use_redundancy_inhibition": os.environ.get("HEBBIAN_USE_REDUNDANCY_INHIBITION", "false").lower() == "true",
             "inhibition_gamma": os.environ.get("HEBBIAN_INHIBITION_GAMMA", "0.2"),
+            "generation_temperature": os.environ.get("HEBBIAN_GENERATION_TEMPERATURE", os.environ.get("HEBBIAN_TEMPERATURE", "0.7")),
+            "extraction_temperature": os.environ.get("HEBBIAN_EXTRACTION_TEMPERATURE", os.environ.get("HEBBIAN_TEMPERATURE", "0.7")),
+            "judge_temperature": os.environ.get("HEBBIAN_JUDGE_TEMPERATURE", os.environ.get("HEBBIAN_TEMPERATURE", "0.7")),
             "generation_model": model_for("generation"),
             "judge_model": model_for("judge"),
         },
@@ -799,12 +805,14 @@ def main() -> None:
     parser.add_argument("--results_dir", default=None)
     parser.add_argument("--no_resume", action="store_true")
     parser.add_argument("--use-redundancy-inhibition", action="store_true")
+    parser.add_argument("--use-preselection-pool", action="store_true")
     parser.add_argument("--inhibition-gamma", type=float, default=0.2)
 
     args = parser.parse_args()
 
     top_k = args.top_k or int(os.environ.get("HEBBIAN_TOP_K", "20"))
     os.environ["HEBBIAN_USE_REDUNDANCY_INHIBITION"] = str(args.use_redundancy_inhibition).lower()
+    os.environ["HEBBIAN_USE_PRESELECTION_POOL"] = str(args.use_preselection_pool).lower()
     os.environ["HEBBIAN_INHIBITION_GAMMA"] = str(args.inhibition_gamma)
 
     eval_longmemeval(
