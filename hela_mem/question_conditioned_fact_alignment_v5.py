@@ -47,7 +47,6 @@ Important rules:
 - Do not merge different facts merely because they mention the same entity or topic.
 - Keep slot descriptions specific enough to distinguish different answer components.
 - For list/count/aggregation questions, different items should remain distinguishable.
-- Use only the Base Memory IDs shown above. Do not invent, rename, or repeat an ID.
 
 Return valid JSON only:
 {{
