@@ -191,6 +191,13 @@ def process_item(
             for node_id in dict.fromkeys(baseline_flipped + oracle_flipped)
         },
         "calibrated_directed_edge_count": len(edge_multipliers),
+        "oracle_edge_labels": {
+            target["candidate_id"]: labels.get(
+                target["candidate_id"],
+                {"label": "uncertain", "rationale": "missing", "confidence": 0.0},
+            )
+            for target in current_record["candidate_targets"]
+        },
         "calibrated_label_counts": dict(Counter(
             labels.get(target["candidate_id"], {}).get("label", "uncertain")
             for target in current_record["candidate_targets"]
@@ -221,7 +228,7 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def fingerprint(args: argparse.Namespace) -> str:
     values = {
-        "protocol_version": "exact_oracle_v05_1",
+        "protocol_version": "exact_oracle_v05_2",
         "top_k": args.top_k, "max_flipped": args.max_flipped,
         "activation_alpha": args.activation_alpha,
         "spreading_threshold": args.spreading_threshold,
