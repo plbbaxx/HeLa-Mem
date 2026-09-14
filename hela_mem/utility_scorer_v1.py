@@ -66,25 +66,16 @@ or
 IRRELEVANT"""
 
 
-def compact_text(text: str, limit: int) -> str:
-    value = re.sub(r"\s+", " ", text or "").strip()
-    if len(value) <= limit:
-        return value
-    head = limit // 2
-    tail = limit - head - 1
-    return value[:head] + "…" + value[-tail:]
-
-
 def build_scorer_prompt(question: str, base_memories: List[Dict[str, str]], candidate: str) -> str:
     """Construct the scorer input.  No answer/gold parameter exists by design."""
     base_text = "\n".join(
-        f"[{index}] {compact_text(memory.get('content', ''), 3500)}"
+        f"[{index}] {memory.get('content', '').strip()}"
         for index, memory in enumerate(base_memories, start=1)
     )
     return PROMPT_TEMPLATE.format(
         question=question,
         base_memories=base_text,
-        candidate=compact_text(candidate, 5000),
+        candidate=(candidate or "").strip(),
     )
 
 
@@ -439,7 +430,7 @@ def main() -> None:
         "answer_generation_executed": False, "benchmark_judge_executed": False,
         "graph_mutation_executed": False, "model": args.model, "temperature": 0.0,
         "prompt_template": PROMPT_TEMPLATE,
-        "prompt_context_policy": "All Base Top-15 entries included; each Base memory keeps first and last text within 3500 characters; candidate within 5000 characters.",
+        "prompt_context_policy": "All Base Top-15 memories and the candidate are included without text truncation.",
         "retrieval_parameters": v05_parameters,
         "inputs": {"data_path": args.data_path, "mem_dir": args.mem_dir, "oracle_v05": args.oracle_v05},
         "classification_metrics": classification, "retrieval_replay_metrics": replay,
