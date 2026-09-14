@@ -7,8 +7,7 @@ PORT="${VLLM_PORT:-8000}"
 MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-32768}"
 GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
 
-exec python -m vllm.entrypoints.openai.api_server \
-  --model "$MODEL_PATH" \
+exec vllm serve "$MODEL_PATH" \
   --served-model-name "$SERVED_NAME" \
   --host 127.0.0.1 \
   --port "$PORT" \
