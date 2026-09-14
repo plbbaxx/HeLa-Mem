@@ -200,18 +200,23 @@ def parse_candidate_claim(text: str) -> Dict[str, Any]:
 
 def parse_alignment(text: str, valid_base_ids: Iterable[str]) -> Dict[str, Any]:
     value = _json(text)
-    if not isinstance(value, dict) or set(value) != {"label", "matched_base_memory_id", "matched_slot", "reason"}:
-        raise ValueError("alignment JSON has invalid fields")
-    label = value.get("label")
-    if label not in CLASSES or not isinstance(value["reason"], str) or not value["reason"].strip():
-        raise ValueError("alignment requires valid label and reason")
-    base_id, slot = value["matched_base_memory_id"], value["matched_slot"]
+    if not isinstance(value, dict):
+        raise ValueError("alignment output must be an object")
+    label = str(value.get("label", "")).strip().upper()
+    reason = value.get("reason")
+    reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No structured reason returned by model."
+    base_id, slot = value.get("matched_base_memory_id"), value.get("matched_slot")
+    # A positive REDUNDANT decision has an asymmetric safety requirement: it
+    # must be grounded in a real Base claim.  An incomplete or invented match
+    # is therefore an abstention (IRRELEVANT), not a guessed redundancy.
     if label == "REDUNDANT":
         if not isinstance(base_id, str) or base_id not in {str(x) for x in valid_base_ids} or not isinstance(slot, str) or not slot.strip():
-            raise ValueError("REDUNDANT requires a valid Base memory id and slot")
-    elif base_id is not None or slot is not None:
-        raise ValueError("non-REDUNDANT alignment requires null match fields")
-    return {"label": label, "matched_base_memory_id": base_id, "matched_slot": slot.strip() if isinstance(slot, str) else None, "reason": value["reason"].strip()}
+            return {"label": "IRRELEVANT", "matched_base_memory_id": None, "matched_slot": None, "reason": "Unverifiable REDUNDANT alignment downgraded to IRRELEVANT."}
+        return {"label": label, "matched_base_memory_id": base_id, "matched_slot": slot.strip(), "reason": reason}
+    if label in {"SUPPORTING", "IRRELEVANT"}:
+        return {"label": label, "matched_base_memory_id": None, "matched_slot": None, "reason": reason}
+    # Never manufacture a positive utility label from malformed output.
+    return {"label": "IRRELEVANT", "matched_base_memory_id": None, "matched_slot": None, "reason": "Unusable alignment label downgraded to IRRELEVANT."}
 
 
 def _load(path: Path, model: str, prompt_sha: str) -> Dict[str, Any] | None:

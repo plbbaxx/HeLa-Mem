@@ -12,7 +12,8 @@ class V5Test(unittest.TestCase):
     def test_alignment_requires_valid_base_for_redundancy(self):
         parsed=parse_alignment('{"label":"REDUNDANT","matched_base_memory_id":"1","matched_slot":"place","reason":"same place"}',["1"])
         self.assertEqual(parsed["label"],"REDUNDANT")
-        with self.assertRaises(ValueError): parse_alignment('{"label":"REDUNDANT","matched_base_memory_id":"2","matched_slot":"place","reason":"x"}',["1"])
+        self.assertEqual(parse_alignment('{"label":"REDUNDANT","matched_base_memory_id":"2","matched_slot":"place"}',["1"])["label"],"IRRELEVANT")
+        self.assertEqual(parse_alignment('{"label":"supporting"}',["1"])["label"],"SUPPORTING")
     def test_prompts_are_gold_free(self):
         self.assertNotIn("REFERENCE ANSWER",build_base_claim_prompt("Q",[{"memory_id":"1","content":"x"}]).upper())
         self.assertIn("CANDIDATE MEMORY",build_candidate_claim_prompt("Q","x"))
