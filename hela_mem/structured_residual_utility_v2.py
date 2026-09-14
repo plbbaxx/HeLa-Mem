@@ -170,9 +170,14 @@ def parse_gap_response(text: str) -> Dict[str, Any]:
 
 def parse_stage2_response(text: str) -> str:
     value = strip_code_fence(text).upper()
-    if value not in STAGE2_LABELS:
+    # Qwen3 occasionally emits a valid label on the first line followed by an
+    # explanation despite the output constraint.  Accept only that standalone
+    # first-line label and preserve the raw response in the artifact for audit;
+    # never infer a label from prose that lacks this unambiguous prefix.
+    first_line = value.splitlines()[0].strip() if value else ""
+    if first_line not in STAGE2_LABELS:
         raise ValueError(f"invalid Stage 2 output: {value[:160]!r}")
-    return value
+    return first_line
 
 
 def chat(prompt: str, model: str, max_tokens: int, parser, retries: int) -> tuple[Any, str]:

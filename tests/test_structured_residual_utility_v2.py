@@ -27,8 +27,9 @@ class StructuredResidualUtilityV2Test(unittest.TestCase):
 
     def test_stage2_output_is_constrained(self):
         self.assertEqual(parse_stage2_response("fills_gap"), "FILLS_GAP")
+        self.assertEqual(parse_stage2_response("FILLS_GAP\n\nExplanation: candidate supplies the location."), "FILLS_GAP")
         with self.assertRaises(ValueError):
-            parse_stage2_response("FILLS_GAP because useful")
+            parse_stage2_response("The label is FILLS_GAP")
 
     def test_predeclared_gate(self):
         classification = {
