@@ -1,6 +1,6 @@
 import unittest
 
-from hela_mem.build_utility_dataset import build_pairs, describe, graph_candidates, split_ids, transition
+from hela_mem.build_utility_dataset import build_pairs, describe, gold_logprob_values, graph_candidates, stratified_split, transition
 
 
 class UtilityDatasetTest(unittest.TestCase):
@@ -24,8 +24,27 @@ class UtilityDatasetTest(unittest.TestCase):
 
     def test_stats_split_transition(self):
         self.assertEqual(transition(False, True), "W2C")
-        self.assertEqual(sum(map(len, split_ids([str(i) for i in range(20)]).values())), 20)
         self.assertEqual(describe([1, 2])["median"], 1.5)
+
+    def test_stratified_split_uses_only_candidate_questions(self):
+        rows=[]
+        for i in range(20):
+            rows.extend([
+                {"question_id":str(i),"utility_score":-.2 if i<6 else 0},
+                {"question_id":str(i),"utility_score":.2 if i<9 else .01},
+            ])
+        splits,profiles=stratified_split(rows)
+        self.assertEqual(sum(map(len,splits.values())),20)
+        self.assertEqual(set().union(*map(set,splits.values())),set(profiles))
+        self.assertTrue(all(any(profiles[q]["has_positive"] for q in splits[s]) for s in splits))
+        self.assertTrue(all(any(profiles[q]["has_within_question_variation"] for q in splits[s]) for s in splits))
+
+    def test_gold_logprobs_use_exact_gold_span(self):
+        self.assertEqual(gold_logprob_values([None,-.4,-.3,-.2],2,4),[-.3,-.2])
+        with self.assertRaisesRegex(RuntimeError,"missing gold token"):
+            gold_logprob_values([None,-.4,None,-.2],2,4)
+        with self.assertRaisesRegex(RuntimeError,"incomplete prompt"):
+            gold_logprob_values([None,-.4,-.3],2,4)
 
 
 if __name__ == "__main__":

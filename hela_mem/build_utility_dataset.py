@@ -74,6 +74,14 @@ class Calls:
         from openai import OpenAI
         client=OpenAI(api_key=os.environ.get('OPENAI_API_KEY','EMPTY'),base_url=os.environ.get('OPENAI_BASE_URL')); self.c[f'new_{role}_calls']+=1
         r=client.chat.completions.create(model=model,messages=messages,temperature=0.0,top_p=1.0,seed=seed,max_tokens=2000,**chat_extra_body()); return strip_reasoning(r.choices[0].message.content if r.choices else '')
+def gold_logprob_values(token_logprobs,start,full_length):
+    if len(token_logprobs)<full_length:
+        raise RuntimeError(f'incomplete prompt logprobs: expected>={full_length}, received={len(token_logprobs)}, gold_start={start}')
+    gold_lps=token_logprobs[start:full_length]
+    missing=[start+i for i,value in enumerate(gold_lps) if value is None]
+    if missing:
+        raise RuntimeError(f'missing gold token logprobs at token positions {missing[:10]} (count={len(missing)})')
+    return [float(value) for value in gold_lps]
 class GoldScorer:
     def __init__(self,model,path,calls): self.model=model; self.calls=calls; self.available=False; self.reason='not probed'; self.tok=None
     def probe(self,messages,gold):
@@ -92,10 +100,11 @@ class GoldScorer:
         while start<min(len(prefix),len(full)) and prefix[start]==full[start]: start+=1
         if start>=len(full): raise RuntimeError('gold token span empty')
         client=OpenAI(api_key=os.environ.get('OPENAI_API_KEY','EMPTY'),base_url=os.environ.get('OPENAI_BASE_URL')); self.calls.c['new_logprob_calls']+=0 if probe else 1
-        r=client.completions.create(model=self.model,prompt=full,max_tokens=1,temperature=0.0,top_p=1.0,seed=42,echo=True,logprobs=1,extra_body={'prompt_logprobs':1,'add_special_tokens':False})
+        # vLLM's prompt-only scoring path is echo=True with max_tokens=0.
+        # No sampled continuation is requested or included in utility.
+        r=client.completions.create(model=self.model,prompt=full,max_tokens=0,temperature=0.0,top_p=1.0,seed=42,echo=True,logprobs=1,extra_body={'prompt_logprobs':1,'add_special_tokens':False})
         lps=r.choices[0].logprobs.token_logprobs
-        vals=[float(x) for x in lps[start:len(full)] if x is not None]
-        if len(vals)!=len(full)-start: raise RuntimeError('incomplete gold prompt logprobs')
+        vals=gold_logprob_values(lps,start,len(full))
         return {'total_logprob':sum(vals),'mean_logprob_per_token':sum(vals)/len(vals),'token_count':len(vals)}
 def cached_call(path,fp,fn,calls,key):
     hit=cache_read(path,fp)
@@ -119,8 +128,30 @@ def describe(v):
     q=statistics.quantiles(v,n=100,method='inclusive') if len(v)>1 else [v[0]]*99
     return {'count':len(v),'min':min(v),'max':max(v),'mean':statistics.mean(v),'std':statistics.pstdev(v),'p10':q[9],'p25':q[24],'median':statistics.median(v),'p75':q[74],'p90':q[89]}
 def transition(a,b):return ('C' if a else 'W')+'2'+('C' if b else 'W')
-def split_ids(ids):
-    ids=sorted(ids); random.Random(SPLIT_SEED).shuffle(ids); n=len(ids); a=int(.8*n); b=a+int(.1*n); return {'train':sorted(ids[:a]),'dev':sorted(ids[a:b]),'test':sorted(ids[b:])}
+def utility_profiles(rows,threshold=.02):
+    grouped=defaultdict(list)
+    for row in rows:grouped[row['question_id']].append(float(row['utility_score']))
+    return {qid:{'has_positive':max(values)>threshold,'has_negative':min(values)<-threshold,'has_within_question_variation':max(values)-min(values)>threshold,'candidate_count':len(values),'utility_min':min(values),'utility_max':max(values)} for qid,values in grouped.items()}
+def stratified_split(rows):
+    """Deterministic multi-label split over candidate-bearing questions only."""
+    profiles=utility_profiles(rows);ids=sorted(profiles);n=len(ids)
+    capacities={'train':int(.8*n),'dev':int(.1*n)};capacities['test']=n-capacities['train']-capacities['dev']
+    labels=('has_positive','has_negative','has_within_question_variation')
+    totals={label:sum(profiles[qid][label] for qid in ids) for label in labels}
+    targets={split:{label:totals[label]*capacities[split]/max(1,n) for label in labels} for split in capacities}
+    rng=random.Random(SPLIT_SEED);tie={qid:rng.random() for qid in ids}
+    rarity=lambda qid:sum(1/max(1,totals[label]) for label in labels if profiles[qid][label])
+    order=sorted(ids,key=lambda qid:(-rarity(qid),-profiles[qid]['candidate_count'],tie[qid],qid))
+    assigned={split:[] for split in capacities};counts={split:Counter() for split in capacities}
+    for qid in order:
+        available=[split for split in capacities if len(assigned[split])<capacities[split]]
+        def score(split):
+            label_need=sum(max(0.0,targets[split][label]-counts[split][label])/max(1.0,targets[split][label]) for label in labels if profiles[qid][label])
+            capacity_need=(capacities[split]-len(assigned[split]))/max(1,capacities[split])
+            return (label_need,capacity_need,{'test':2,'dev':1,'train':0}[split])
+        chosen=max(available,key=score);assigned[chosen].append(qid)
+        for label in labels:counts[chosen][label]+=int(profiles[qid][label])
+    return {split:sorted(values) for split,values in assigned.items()},profiles
 def build_pairs(rows,eps,semantic_lo,semantic_hi,utility_p75):
     grouped=defaultdict(list)
     for r in rows:grouped[r['question_id']].append(r)
@@ -140,7 +171,7 @@ def build_pairs(rows,eps,semantic_lo,semantic_hi,utility_p75):
 def main():
     p=argparse.ArgumentParser();
     for x in ('data-path','mem-dir','base-predictions','oracle-v05','output-dir','local-model-path'):p.add_argument('--'+x,required=True)
-    p.add_argument('--top-k',type=int,default=15);p.add_argument('--workers',type=int,default=8);p.add_argument('--num-items',type=int);a=p.parse_args();out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True);os.environ['HEBBIAN_LOCAL_MODEL_PATH']=a.local_model_path
+    p.add_argument('--top-k',type=int,default=15);p.add_argument('--workers',type=int,default=8);p.add_argument('--num-items',type=int);p.add_argument('--require-continuous',action=argparse.BooleanOptionalAction,default=True);a=p.parse_args();out=Path(a.output_dir);out.mkdir(parents=True,exist_ok=True);os.environ['HEBBIAN_LOCAL_MODEL_PATH']=a.local_model_path
     data=json.loads(Path(a.data_path).read_text(encoding='utf-8')); data=data[:a.num_items] if a.num_items else data; preds=load_jsonl(Path(a.base_predictions)); calls=Calls(); bases=[]; failures=[]
     for idx,item in enumerate(data):
         qid=str(item['question_id']); gp=Path(a.mem_dir)/f'{qid}_hebbian.json'
@@ -151,6 +182,7 @@ def main():
     gen_model=model_for('generation');judge_model=model_for('judge'); scorer=GoldScorer(gen_model,a.local_model_path,calls)
     probe_base=next((b for b in bases if b['candidates']),None)
     if probe_base: scorer.probe(intervention_messages(probe_base)[0],probe_base['gold_answer'])
+    if a.require_continuous and not scorer.available:raise RuntimeError(f'continuous utility is required but unavailable: {scorer.reason}')
     def baseline(b):
         qid=b['question_id']; messages,user,context=intervention_messages(b); fp=fingerprint({'v':1,'messages':messages,'model':gen_model,'temperature':0,'top_p':1,'seed':42})
         ans=cached_call(out/'cache/baseline_answer'/f'{qid}.json',fp,lambda:{'answer':calls.chat(messages,'generation',gen_model)},calls,'baseline_answer')
@@ -195,12 +227,15 @@ def main():
     rows.sort(key=lambda x:(x['question_id'],x['candidate_memory_id']));dump_jsonl(out/'candidate_utility.jsonl',rows);dump_jsonl(out/'failures.jsonl',failures)
     vals=[r['utility_score'] for r in rows];cont=[r['delta_gold_mean_logprob'] for r in rows if r['continuous_signal_available']];sem=[(r['semantic_score'],r['utility_score']) for r in rows if r['semantic_score'] is not None];heb=[(r['hebbian_score'],r['utility_score']) for r in rows if r['hebbian_score'] is not None];spr=[(r['spreading_score'],r['utility_score']) for r in rows if r['spreading_score'] is not None]
     def corr(p):return {'n':len(p),'pearson':pearson([x for x,y in p],[y for x,y in p]),'spearman':pearson(ranks([x for x,y in p]),ranks([y for x,y in p])) if len(p)>1 else None}
-    stats={'utility':describe(vals),'delta_gold_mean_logprob':describe(cont),'positive':sum(x>.02 for x in vals),'near_zero':sum(abs(x)<=.02 for x in vals),'negative':sum(x<-.02 for x in vals),'category_epsilon':.02,'correlations':{'semantic':corr(sem),'hebbian':corr(heb),'spreading':corr(spr)}};atomic_write_json(out/'utility_statistics.json',stats)
+    by_transition=defaultdict(list)
+    for row in rows:by_transition[row['transition']].append(row['utility_score'])
+    stats={'utility':describe(vals),'delta_gold_mean_logprob':describe(cont),'positive':sum(x>.02 for x in vals),'near_zero':sum(abs(x)<=.02 for x in vals),'negative':sum(x<-.02 for x in vals),'category_epsilon':.02,'utility_by_answer_transition':{key:describe(value) for key,value in sorted(by_transition.items())},'correlations':{'semantic':corr(sem),'hebbian':corr(heb),'spreading':corr(spr)}};atomic_write_json(out/'utility_statistics.json',stats)
     sem_quartiles=statistics.quantiles([x for x,y in sem],n=4,method='inclusive') if len(sem)>1 else None;sem_lo=sem_quartiles[0] if sem_quartiles else None;sem_hi=sem_quartiles[2] if sem_quartiles else None;up75=statistics.quantiles(vals,n=4,method='inclusive')[2] if len(vals)>1 else None;pair_stats={}
     for eps,name in zip(EPSILONS,('eps0','eps002','eps005','eps010')):
-        ps=build_pairs(rows,eps,sem_lo,sem_hi,up75);dump_jsonl(out/f'pairwise_preferences_{name}.jsonl',ps);pair_stats[str(eps)]={'count':len(ps),'type_counts':dict(Counter(t for p in ps for t in p['pair_types']))}
-    atomic_write_json(out/'pair_statistics.json',pair_stats);splits=split_ids([b['question_id'] for b in bases]);[atomic_write_json(out/f'{k}_question_ids.json',v) for k,v in splits.items()]
-    atomic_write_json(out/'split_manifest.json',{'unit':'question_id','seed':SPLIT_SEED,'ratios':{'train':.8,'dev':.1,'test':.1},'counts':{k:len(v) for k,v in splits.items()},'question_ids':splits})
+        ps=build_pairs(rows,eps,sem_lo,sem_hi,up75);dump_jsonl(out/f'pairwise_preferences_{name}.jsonl',ps);pair_stats[str(eps)]={'count':len(ps),'question_count':len({p['question_id'] for p in ps}),'type_counts':dict(Counter(t for p in ps for t in p['pair_types']))}
+    atomic_write_json(out/'pair_statistics.json',pair_stats);splits,profiles=stratified_split(rows);[atomic_write_json(out/f'{k}_question_ids.json',v) for k,v in splits.items()]
+    split_profile_counts={split:{label:sum(profiles[qid][label] for qid in ids) for label in ('has_positive','has_negative','has_within_question_variation')}|{'candidate_count':sum(profiles[qid]['candidate_count'] for qid in ids)} for split,ids in splits.items()}
+    atomic_write_json(out/'split_manifest.json',{'unit':'question_id','population':'candidate-bearing questions only','seed':SPLIT_SEED,'ratios':{'train':.8,'dev':.1,'test':.1},'stratification_threshold':.02,'stratification_labels':['has_positive','has_negative','has_within_question_variation'],'counts':{k:len(v) for k,v in splits.items()},'profile_counts':split_profile_counts,'question_profiles':profiles,'question_ids':splits})
     oracle=json.loads(Path(a.oracle_v05).read_text(encoding='utf-8'));omap={(str(q['question_id']),str(cid)):lab.get('label','uncertain').upper() for q in oracle.get('records',[]) for cid,lab in q.get('oracle_edge_labels',{}).items()};bylab=defaultdict(list)
     for r in rows:
         label=omap.get((r['question_id'],r['candidate_memory_id']))
@@ -208,6 +243,6 @@ def main():
     def prob(a,b):return sum(x>y for x in a for y in b)/(len(a)*len(b)) if a and b else None
     oracle_analysis={'matched':sum(map(len,bylab.values())),'by_label':{k:describe(v) for k,v in bylab.items()},'p_supporting_gt_redundant':prob(bylab['SUPPORTING'],bylab['REDUNDANT']),'p_supporting_gt_irrelevant':prob(bylab['SUPPORTING'],bylab['IRRELEVANT'])};atomic_write_json(out/'oracle_cross_validation.json',oracle_analysis)
     sizes=[len(b['candidates']) for b in bases];summary={'total_questions':len(bases),'questions_with_candidates':sum(x>0 for x in sizes),'candidate_total':len(candidates),'average_candidates_per_question':statistics.mean(sizes) if sizes else 0,'median_candidates_per_question':statistics.median(sizes) if sizes else 0,'average_candidates_per_candidate_question':len(candidates)/max(1,sum(x>0 for x in sizes)),'median_candidates_per_candidate_question':statistics.median([x for x in sizes if x]) if any(sizes) else 0,'max_candidates':max(sizes,default=0),'transitions':dict(Counter(r['transition'] for r in rows)),'continuous_signal_available':scorer.available,'continuous_signal_reason':scorer.reason,'calls':dict(calls.c),'failures':len(failures)};atomic_write_json(out/'intervention_summary.json',summary)
-    manifest={'protocol':'base_conditioned_utility_dataset_v1','candidate_definition':'unique one-hop non-Base neighbors of frozen Base Top-15 in the encoded Hebbian graph','utility_formula':'delta_gold_mean_logprob when available, else delta_answer','reader_model':gen_model,'judge_model':judge_model,'temperature':0,'top_p':1,'seed':42,'split_seed':SPLIT_SEED,'split_counts':{k:len(v) for k,v in splits.items()},'dataset_sha256':sha256_file(a.data_path),'git_commit':git_commit(),'inputs':vars(a),'outputs':[p.name for p in out.iterdir() if p.is_file()]};atomic_write_json(out/'dataset_manifest.json',manifest)
+    manifest={'protocol':'base_conditioned_utility_dataset_v1_1','candidate_definition':'unique one-hop non-Base neighbors of frozen Base Top-15 in the encoded Hebbian graph','utility_formula':'delta_gold_mean_logprob when available, else delta_answer','reader_model':gen_model,'judge_model':judge_model,'temperature':0,'top_p':1,'seed':42,'split_seed':SPLIT_SEED,'split_population':'candidate-bearing questions only','split_counts':{k:len(v) for k,v in splits.items()},'dataset_sha256':sha256_file(a.data_path),'git_commit':git_commit(),'inputs':vars(a),'outputs':[p.name for p in out.iterdir() if p.is_file()]};atomic_write_json(out/'dataset_manifest.json',manifest)
     print(json.dumps(summary,ensure_ascii=False,indent=2));print(f'report\t{out}')
 if __name__=='__main__':main()
