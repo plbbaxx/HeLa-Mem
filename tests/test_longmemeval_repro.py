@@ -17,6 +17,7 @@ if not hasattr(__import__("openai"), "OpenAI"):
 
 from hela_mem import encode_longmemeval as enc
 from hela_mem import eval_longmemeval as ev
+from hela_mem.hebbian_memory import HebbianMemoryGraph, apply_lateral_inhibition
 
 
 class FakeExtractionClient:
@@ -48,6 +49,41 @@ def item(index):
 
 
 class ReproPipelineTest(unittest.TestCase):
+    def test_lateral_inhibition_formula(self):
+        scores = np.array([1.0, 0.8, 0.2])
+        actual = apply_lateral_inhibition(scores, beta=0.15, top_m=2)
+        np.testing.assert_allclose(actual, [1.0, 0.77, 0.0])
+        self.assertEqual(
+            np.argsort(scores)[::-1].tolist(),
+            np.argsort(actual)[::-1].tolist(),
+        )
+
+    def test_disabled_inhibition_is_baseline_equivalent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            graph = HebbianMemoryGraph(str(Path(temp) / "memory.json"))
+            graph.nodes = {
+                str(i): {"id": str(i), "content": str(i), "embedding": [float(i), 1.0, 0.0], "timestamp": "2026-01-01", "keywords": []}
+                for i in range(3)
+            }
+            with patch("hela_mem.hebbian_memory.get_embedding", lambda text: np.array([1.0, 1.0, 0.0])), \
+                 patch("hela_mem.hebbian_memory.llm_extract_keywords", lambda text: set()), \
+                 patch("hela_mem.hebbian_memory.compute_time_decay", lambda *args: 1.0):
+                graph.use_inhibition = False
+                graph.retrieve("query", top_k=2)
+            trace = graph.last_retrieval_trace
+            self.assertEqual(trace["final_scores"], trace["inhibited_scores"])
+            self.assertEqual(trace["rank_before"], trace["rank_after"])
+            self.assertEqual(trace["flipped_memory_ids_before"], trace["flipped_memory_ids_after"])
+
+            graph.use_inhibition = True
+            with patch("hela_mem.hebbian_memory.get_embedding", lambda text: np.array([1.0, 1.0, 0.0])), \
+                 patch("hela_mem.hebbian_memory.llm_extract_keywords", lambda text: set()), \
+                 patch("hela_mem.hebbian_memory.compute_time_decay", lambda *args: 1.0):
+                graph.retrieve("query", top_k=2)
+            inhibited_trace = graph.last_retrieval_trace
+            self.assertEqual(trace["base_top_k_ids"], inhibited_trace["base_top_k_ids"])
+            self.assertEqual(inhibited_trace["rank_before"], inhibited_trace["rank_after"])
+
     def test_five_items_resume_and_eval_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -6,6 +6,9 @@ NUM_ITEMS="5"
 CONCURRENCY="4"
 ARTIFACT_ROOT="artifacts/longmemeval_qwen3_4b"
 DATA_PATH="data/longmemeval_s.json"
+USE_INHIBITION="false"
+INHIBITION_BETA="0.15"
+INHIBITION_TOP_M="7"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --stage) STAGE="$2"; shift 2 ;;
@@ -13,6 +16,9 @@ while [[ $# -gt 0 ]]; do
     --concurrency) CONCURRENCY="$2"; shift 2 ;;
     --artifact-root) ARTIFACT_ROOT="$2"; shift 2 ;;
     --data-path) DATA_PATH="$2"; shift 2 ;;
+    --use-inhibition) USE_INHIBITION="true"; shift ;;
+    --inhibition-beta) INHIBITION_BETA="$2"; shift 2 ;;
+    --inhibition-top-m) INHIBITION_TOP_M="$2"; shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -42,6 +48,9 @@ export HEBBIAN_KEYWORD_WEIGHT="${HEBBIAN_KEYWORD_WEIGHT:-0.7}"
 export HEBBIAN_TOP_K="${HEBBIAN_TOP_K:-15}"
 export HEBBIAN_SEMANTIC_TOP_K="${HEBBIAN_SEMANTIC_TOP_K:-5}"
 export HEBBIAN_KNOWLEDGE_BUFFER_SIZE="${HEBBIAN_KNOWLEDGE_BUFFER_SIZE:-10}"
+export HEBBIAN_USE_INHIBITION="$USE_INHIBITION"
+export HEBBIAN_INHIBITION_BETA="$INHIBITION_BETA"
+export HEBBIAN_INHIBITION_TOP_M="$INHIBITION_TOP_M"
 
 if [[ "$STAGE" == "encode" || "$STAGE" == "all" ]]; then
   python -m hela_mem.encode_longmemeval \
@@ -52,9 +61,13 @@ fi
 if [[ "$STAGE" == "eval" || "$STAGE" == "all" ]]; then
   CONSOLIDATION_ARGS=()
   if [[ "${HEBBIAN_USE_CONSOLIDATION:-false}" == "true" ]]; then CONSOLIDATION_ARGS+=(--use_consolidation); fi
+  INHIBITION_ARGS=()
+  if [[ "$USE_INHIBITION" == "true" ]]; then INHIBITION_ARGS+=(--use-inhibition); fi
   python -m hela_mem.eval_longmemeval \
     --data_path "$DATA_PATH" --mem_dir "$ENCODED_DIR" --results_dir "$EVAL_DIR" \
     --num_items "$NUM_ITEMS" --concurrency "$CONCURRENCY" \
     --top_k "$HEBBIAN_TOP_K" --semantic_top_k "$HEBBIAN_SEMANTIC_TOP_K" \
+    --inhibition-beta "$INHIBITION_BETA" --inhibition-top-m "$INHIBITION_TOP_M" \
+    "${INHIBITION_ARGS[@]}" \
     "${CONSOLIDATION_ARGS[@]}"
 fi
