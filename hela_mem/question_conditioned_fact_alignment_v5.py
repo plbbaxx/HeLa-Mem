@@ -47,6 +47,7 @@ Important rules:
 - Do not merge different facts merely because they mention the same entity or topic.
 - Keep slot descriptions specific enough to distinguish different answer components.
 - For list/count/aggregation questions, different items should remain distinguishable.
+- Use only the Base Memory IDs shown above. Do not invent, rename, or repeat an ID.
 
 Return valid JSON only:
 {{
@@ -165,13 +166,21 @@ def parse_base_claims(text: str, expected_ids: Iterable[str]) -> List[Dict[str, 
         raise ValueError("base output must be {claims: [...]}")
     claims = [_claim(row, True) for row in value["claims"]]
     ordered_ids, expected = [str(x) for x in expected_ids], {str(x) for x in expected_ids}
-    found = [row["memory_id"] for row in claims]
-    if len(found) != len(set(found)) or not set(found).issubset(expected):
-        raise ValueError("base claims contain duplicate or unknown Base memory_id")
+    # A small model occasionally repeats an ID or emits an invented ID despite
+    # the prompt.  Such a claim cannot be safely grounded in the Base context,
+    # so retain only the first claim with a real, unique ID.  Omitted real IDs
+    # remain explicit irrelevant claims below.  This recovery never maps an
+    # invented claim onto a different memory.
+    valid_claims, seen = [], set()
+    for claim in claims:
+        memory_id = claim["memory_id"]
+        if memory_id in expected and memory_id not in seen:
+            valid_claims.append(claim)
+            seen.add(memory_id)
     # Models often return only relevant claims.  Restore omitted Base entries as
     # explicit irrelevant claims so alignment still receives the complete Top-K
     # evidence state without fabricating slot/value content.
-    by_id = {row["memory_id"]: row for row in claims}
+    by_id = {row["memory_id"]: row for row in valid_claims}
     return [by_id.get(memory_id, {"memory_id": memory_id, "answer_relevant": False, "slot": None, "value": None}) for memory_id in ordered_ids]
 
 
