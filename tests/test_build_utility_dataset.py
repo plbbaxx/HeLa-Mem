@@ -1,6 +1,6 @@
 import unittest
 
-from hela_mem.build_utility_dataset import build_pairs, describe, gold_logprob_values, graph_candidates, stratified_split, transition
+from hela_mem.build_utility_dataset import build_pairs, describe, gold_logprob_values, gold_prompt_token_span, graph_candidates, stratified_split, transition
 
 
 class UtilityDatasetTest(unittest.TestCase):
@@ -45,6 +45,19 @@ class UtilityDatasetTest(unittest.TestCase):
             gold_logprob_values([None,-.4,None,-.2],2,4)
         with self.assertRaisesRegex(RuntimeError,"incomplete prompt"):
             gold_logprob_values([None,-.4,-.3],2,4)
+
+    def test_gold_span_reuses_one_textual_reader_prefix(self):
+        class Encoded:
+            def __init__(self,ids):self.input_ids=ids
+        class Tokenizer:
+            def apply_chat_template(self,messages,tokenize,add_generation_prompt):
+                self.template_calls=getattr(self,"template_calls",0)+1
+                return "<assistant>\n"
+            def __call__(self,text,add_special_tokens):
+                return Encoded(list(text.encode()))
+        tok=Tokenizer();full,start=gold_prompt_token_span(tok,[{"role":"user","content":"q"}],"gold")
+        self.assertEqual(tok.template_calls,1)
+        self.assertEqual(bytes(full[start:]).decode(),"gold")
 
 
 if __name__ == "__main__":

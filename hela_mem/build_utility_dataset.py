@@ -82,6 +82,16 @@ def gold_logprob_values(token_logprobs,start,full_length):
     if missing:
         raise RuntimeError(f'missing gold token logprobs at token positions {missing[:10]} (count={len(missing)})')
     return [float(value) for value in gold_lps]
+def gold_prompt_token_span(tokenizer,messages,gold):
+    """Build one textual chat prefix and append gold without a second template mode."""
+    prefix_text=tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
+    prefix=tokenizer(prefix_text,add_special_tokens=False).input_ids
+    full=tokenizer(prefix_text+gold,add_special_tokens=False).input_ids
+    start=0
+    while start<min(len(prefix),len(full)) and prefix[start]==full[start]:start+=1
+    if start==0:raise RuntimeError('reader prefix and gold prompt have no common token prefix')
+    if start>=len(full):raise RuntimeError('gold token span empty')
+    return full,start
 class GoldScorer:
     def __init__(self,model,path,calls): self.model=model; self.calls=calls; self.available=False; self.reason='not probed'; self.tok=None
     def probe(self,messages,gold):
@@ -94,11 +104,7 @@ class GoldScorer:
     def score(self,messages,gold,probe=False):
         from openai import OpenAI
         if not self.tok: raise RuntimeError('tokenizer unavailable')
-        prefix=self.tok.apply_chat_template(messages,tokenize=True,add_generation_prompt=True)
-        full=self.tok.apply_chat_template(messages+[{'role':'assistant','content':gold}],tokenize=True,continue_final_message=True)
-        start=0
-        while start<min(len(prefix),len(full)) and prefix[start]==full[start]: start+=1
-        if start>=len(full): raise RuntimeError('gold token span empty')
+        full,start=gold_prompt_token_span(self.tok,messages,gold)
         client=OpenAI(api_key=os.environ.get('OPENAI_API_KEY','EMPTY'),base_url=os.environ.get('OPENAI_BASE_URL')); self.calls.c['new_logprob_calls']+=0 if probe else 1
         # vLLM's prompt-only scoring path is echo=True with max_tokens=0.
         # No sampled continuation is requested or included in utility.
