@@ -33,7 +33,7 @@ QUESTION:
 BASE MEMORIES:
 {base_memories_with_ids}
 
-For every Base Memory, determine whether it contains a concrete fact that helps answer the Question.
+For every Base Memory, determine whether it contains a concrete fact that helps answer the Question.  Include every answer-relevant Base Memory in claims; you may omit memories that are not answer-relevant.
 
 If it does, extract:
 - slot: the specific answer component or sub-question addressed by this fact
@@ -164,10 +164,15 @@ def parse_base_claims(text: str, expected_ids: Iterable[str]) -> List[Dict[str, 
     if not isinstance(value, dict) or set(value) != {"claims"} or not isinstance(value["claims"], list):
         raise ValueError("base output must be {claims: [...]}")
     claims = [_claim(row, True) for row in value["claims"]]
-    expected, found = {str(x) for x in expected_ids}, [row["memory_id"] for row in claims]
-    if set(found) != expected or len(found) != len(expected):
-        raise ValueError("base claims must contain every Base memory_id exactly once")
-    return sorted(claims, key=lambda row: found.index(row["memory_id"]))
+    ordered_ids, expected = [str(x) for x in expected_ids], {str(x) for x in expected_ids}
+    found = [row["memory_id"] for row in claims]
+    if len(found) != len(set(found)) or not set(found).issubset(expected):
+        raise ValueError("base claims contain duplicate or unknown Base memory_id")
+    # Models often return only relevant claims.  Restore omitted Base entries as
+    # explicit irrelevant claims so alignment still receives the complete Top-K
+    # evidence state without fabricating slot/value content.
+    by_id = {row["memory_id"]: row for row in claims}
+    return [by_id.get(memory_id, {"memory_id": memory_id, "answer_relevant": False, "slot": None, "value": None}) for memory_id in ordered_ids]
 
 
 def parse_candidate_claim(text: str) -> Dict[str, Any]:
