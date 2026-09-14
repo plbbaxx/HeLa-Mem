@@ -56,6 +56,7 @@ class UtilityScorerV1Test(unittest.TestCase):
         self.assertEqual(metrics["useful_questions_rescued"], 1)
         self.assertEqual(metrics["oracle_selection_recall"], 0.5)
         self.assertEqual(metrics["oracle_exact_match_rate_on_changed_questions"], 0.0)
+        self.assertEqual(metrics["oracle_selection_precision_on_changed_questions"], 1.0)
 
 
 if __name__ == "__main__":

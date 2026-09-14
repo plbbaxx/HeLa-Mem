@@ -297,6 +297,14 @@ def replay_metrics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "oracle_selection_recall": safe_div(intersection, oracle_total),
         "oracle_selection_precision": safe_div(intersection, automatic_total),
         "oracle_selection_jaccard": safe_div(intersection, union),
+        "oracle_selection_precision_on_changed_questions": safe_div(
+            sum(row["oracle_intersection"] for row in oracle_changed),
+            sum(row["automatic_count"] for row in oracle_changed),
+        ),
+        "oracle_selection_recall_on_changed_questions": safe_div(
+            sum(row["oracle_intersection"] for row in oracle_changed),
+            sum(row["oracle_count"] for row in oracle_changed),
+        ),
     }
 
 
