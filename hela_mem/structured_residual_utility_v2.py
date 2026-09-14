@@ -180,7 +180,7 @@ def parse_stage2_response(text: str) -> str:
     return first_line
 
 
-def chat(prompt: str, model: str, max_tokens: int, parser, retries: int) -> tuple[Any, str]:
+def chat(prompt: str, model: str, max_tokens: int, parser, retries: int, error_observer=None) -> tuple[Any, str]:
     try:
         from openai import OpenAI
     except ImportError as error:
@@ -206,6 +206,8 @@ def chat(prompt: str, model: str, max_tokens: int, parser, retries: int) -> tupl
             return parser(raw or ""), strip_reasoning(raw or "")
         except Exception as error:
             last_error = error
+            if error_observer is not None:
+                error_observer(error)
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"V2 model call failed after {retries} attempts: {last_error}")
 
