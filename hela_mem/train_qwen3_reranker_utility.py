@@ -335,6 +335,28 @@ def score_batch(model: Any, batch: dict[str, Any], yes_id: int, no_id: int) -> A
     return yes_no_logits[:, 0] - yes_no_logits[:, 1]
 
 
+def score_pair_batch(
+    model: Any,
+    batch: dict[str, Any],
+    pair_batch_size: int,
+    yes_id: int,
+    no_id: int,
+    forward_mode: str,
+) -> Any:
+    """Score a pair batch jointly or as two exact, sequential decoder calls."""
+    import torch
+
+    if forward_mode == "joint":
+        return score_batch(model, batch, yes_id, no_id)
+    if forward_mode != "sequential":
+        raise ValueError(f"unknown pair forward mode: {forward_mode}")
+    preferred_batch = {key: value[:pair_batch_size] for key, value in batch.items()}
+    rejected_batch = {key: value[pair_batch_size:] for key, value in batch.items()}
+    preferred_scores = score_batch(model, preferred_batch, yes_id, no_id)
+    rejected_scores = score_batch(model, rejected_batch, yes_id, no_id)
+    return torch.cat((preferred_scores, rejected_scores), dim=0)
+
+
 def forward_shape_diagnostic(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
     """Describe the avoided full-logits allocation for one collated batch."""
     import torch
@@ -582,7 +604,7 @@ def profile_training_options(
         items = None
         return diagnostic
 
-    def run_attempt(batch_size: int, shape_diagnostic: dict[str, Any]) -> dict[str, Any]:
+    def run_attempt(batch_size: int, shape_diagnostic: dict[str, Any], forward_mode: str) -> dict[str, Any]:
         """Use a short-lived frame so failed autograd graphs are releasable."""
         loader = iterator = batch = scores = loss = None
         try:
@@ -598,7 +620,7 @@ def profile_training_options(
             torch.cuda.synchronize()
             started = time.perf_counter()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                scores = score_batch(model, batch, yes_id, no_id)
+                scores = score_pair_batch(model, batch, pair_batch, yes_id, no_id, forward_mode)
                 loss = -functional.logsigmoid(scores[:pair_batch] - scores[pair_batch:]).mean()
             loss.backward()
             torch.cuda.synchronize()
@@ -608,6 +630,7 @@ def profile_training_options(
                 "status": "fit",
                 "batch_size_pairs": batch_size,
                 "sequence_count": batch_size * 2,
+                "pair_forward_mode": forward_mode,
                 "seconds_per_step": elapsed,
                 "nonpad_tokens": token_count,
                 "tokens_per_second": token_count / elapsed,
@@ -629,59 +652,58 @@ def profile_training_options(
             model.enable_input_require_grads()
         else:
             model.gradient_checkpointing_disable()
-        largest_fit = None
-        for batch_size in candidates:
-            cleanup()
-            shape_diagnostic = describe_attempt(batch_size)
-            torch.cuda.reset_peak_memory_stats()
-            before = cuda_memory_snapshot()
-            print(
-                f"Profile attempt: pairs={batch_size} checkpointing={checkpointing} "
-                f"allocated={before['allocated_gib']:.3f}GiB reserved={before['reserved_gib']:.3f}GiB",
-                flush=True,
-            )
-            out_of_memory = False
-            try:
-                result = run_attempt(batch_size, shape_diagnostic)
-                result["gradient_checkpointing"] = checkpointing
-                largest_fit = result
+        for forward_mode in ("joint", "sequential"):
+            largest_fit = None
+            for batch_size in candidates:
                 cleanup()
-                result["memory_before"] = before
-                result["memory_after_cleanup"] = cuda_memory_snapshot()
-                attempts.append(result)
+                shape_diagnostic = describe_attempt(batch_size)
+                torch.cuda.reset_peak_memory_stats()
+                before = cuda_memory_snapshot()
                 print(
-                    f"Profile fit: pairs={batch_size} peak={result['peak_gpu_memory_gib']:.3f}GiB "
-                    f"after_cleanup={result['memory_after_cleanup']['allocated_gib']:.3f}GiB",
+                    f"Profile attempt: pairs={batch_size} checkpointing={checkpointing} "
+                    f"forward_mode={forward_mode} allocated={before['allocated_gib']:.3f}GiB "
+                    f"reserved={before['reserved_gib']:.3f}GiB",
                     flush=True,
                 )
-            except RuntimeError as error:
-                if "out of memory" not in str(error).lower():
-                    raise
-                message = str(error)[:500]
-                failed = {
-                    "status": "oom", "batch_size_pairs": batch_size,
-                    "gradient_checkpointing": checkpointing, "error": message,
-                    "forward_shape_diagnostic": shape_diagnostic,
-                    "memory_before": before,
-                    "memory_at_failure": cuda_memory_snapshot(),
-                }
-                out_of_memory = True
-            if out_of_memory:
-                # The exception and its traceback are now out of scope, so the
-                # failed attempt's local tensors can actually be collected.
-                cleanup()
-                failed["memory_after_cleanup"] = cuda_memory_snapshot()
-                attempts.append(failed)
-                print(
-                    f"Profile OOM cleaned: pairs={batch_size} "
-                    f"failure_allocated={failed['memory_at_failure']['allocated_gib']:.3f}GiB "
-                    f"after_cleanup={failed['memory_after_cleanup']['allocated_gib']:.3f}GiB",
-                    flush=True,
-                )
-                # Since sizes are ascending, all larger candidates are unsafe.
-                break
-        if largest_fit is not None:
-            return {"selected": largest_fit, "attempts": attempts}
+                out_of_memory = False
+                try:
+                    result = run_attempt(batch_size, shape_diagnostic, forward_mode)
+                    result["gradient_checkpointing"] = checkpointing
+                    largest_fit = result
+                    cleanup()
+                    result["memory_before"] = before
+                    result["memory_after_cleanup"] = cuda_memory_snapshot()
+                    attempts.append(result)
+                    print(
+                        f"Profile fit: pairs={batch_size} forward_mode={forward_mode} "
+                        f"peak={result['peak_gpu_memory_gib']:.3f}GiB "
+                        f"after_cleanup={result['memory_after_cleanup']['allocated_gib']:.3f}GiB",
+                        flush=True,
+                    )
+                except RuntimeError as error:
+                    if "out of memory" not in str(error).lower():
+                        raise
+                    message = str(error)[:500]
+                    failed = {
+                        "status": "oom", "batch_size_pairs": batch_size,
+                        "gradient_checkpointing": checkpointing, "pair_forward_mode": forward_mode,
+                        "error": message, "forward_shape_diagnostic": shape_diagnostic,
+                        "memory_before": before, "memory_at_failure": cuda_memory_snapshot(),
+                    }
+                    out_of_memory = True
+                if out_of_memory:
+                    cleanup()
+                    failed["memory_after_cleanup"] = cuda_memory_snapshot()
+                    attempts.append(failed)
+                    print(
+                        f"Profile OOM cleaned: pairs={batch_size} forward_mode={forward_mode} "
+                        f"failure_allocated={failed['memory_at_failure']['allocated_gib']:.3f}GiB "
+                        f"after_cleanup={failed['memory_after_cleanup']['allocated_gib']:.3f}GiB",
+                        flush=True,
+                    )
+                    break
+            if largest_fit is not None:
+                return {"selected": largest_fit, "attempts": attempts}
     cleanup()
     raise RuntimeError(f"profiling found no safe training batch: {attempts}")
 
@@ -745,9 +767,11 @@ def train(
     model, parameter_report, profile = prepare_lora_profile(
         model, tokenizer, rows, train_pairs, encoder, yes_id, no_id, args, output
     )
+    dataset = PairDataset(train_pairs, rows, encoder)
     selected = profile["selected"]
     batch_size = int(selected["batch_size_pairs"])
     checkpointing = bool(selected["gradient_checkpointing"])
+    pair_forward_mode = str(selected["pair_forward_mode"])
     if checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.enable_input_require_grads()
@@ -795,7 +819,7 @@ def train(
             torch.cuda.synchronize()
             started = time.perf_counter()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                scores = score_batch(model, batch, yes_id, no_id)
+                scores = score_pair_batch(model, batch, pair_batch, yes_id, no_id, pair_forward_mode)
                 loss = -functional.logsigmoid(scores[:pair_batch] - scores[pair_batch:]).mean()
                 scaled = loss / args.gradient_accumulation_steps
             scaled.backward()
@@ -810,6 +834,7 @@ def train(
             record = {
                 "epoch": epoch, "step": step, "steps_in_epoch": len(loader),
                 "sampled_pair_count": pair_batch, "loss": losses[-1],
+                "pair_forward_mode": pair_forward_mode,
                 "sampled_question_ids": sampled_question_ids,
                 "learning_rate": scheduler.get_last_lr()[0], "seconds": elapsed,
                 "nonpad_tokens": nonpad_tokens, "tokens_per_second": nonpad_tokens / elapsed,
@@ -823,7 +848,10 @@ def train(
                     f"loss={record['loss']:.6f} sec={elapsed:.2f} tok/s={record['tokens_per_second']:.1f}",
                     flush=True,
                 )
-        dev = evaluate(model, tokenizer, encoder, rows, dev_pairs, split_ids["dev"], yes_id, no_id, True, args.eval_batch_size)
+        dev = evaluate(
+            model, tokenizer, encoder, rows, dev_pairs, split_ids["dev"], yes_id, no_id,
+            True, min(args.eval_batch_size, batch_size),
+        )
         epoch_row = {"epoch": epoch, "train_loss": statistics.mean(losses), **dev}
         dev_history.append(epoch_row)
         atomic_json(output / "dev_metrics_by_epoch.json", dev_history)
@@ -925,7 +953,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage", choices=("audit", "profile", "baselines", "train", "test", "all"), default="all")
     parser.add_argument("--max-length", choices=("auto", "4096", "8192", "16384"), default="auto")
     parser.add_argument("--train-batch-size", type=int, default=0, help="0 profiles 1, 2, 4 pairs and selects the largest safe batch")
-    parser.add_argument("--eval-batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-5)

@@ -10,6 +10,7 @@ from hela_mem.train_qwen3_reranker_utility import (
     forward_shape_diagnostic,
     reciprocal_rank,
     score_batch,
+    score_pair_batch,
     trainable_parameter_report,
 )
 
@@ -124,6 +125,18 @@ class QwenUtilityTrainingTest(unittest.TestCase):
         scores = score_batch(model, batch, yes_id=3, no_id=1)
         expected = torch.tensor([6.0, 6.0])
         torch.testing.assert_close(scores, expected)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is not installed in the lightweight test environment")
+    def test_sequential_pair_scoring_is_identical_to_joint_scoring(self):
+        import torch
+        model = TinyCausalLM()
+        batch = {
+            "input_ids": torch.tensor([[0, 1], [1, 2], [2, 0], [0, 2]]),
+            "attention_mask": torch.ones((4, 2), dtype=torch.long),
+        }
+        joint = score_pair_batch(model, batch, 2, yes_id=3, no_id=1, forward_mode="joint")
+        sequential = score_pair_batch(model, batch, 2, yes_id=3, no_id=1, forward_mode="sequential")
+        torch.testing.assert_close(joint, sequential)
 
     @unittest.skipUnless(importlib.util.find_spec("torch"), "torch is not installed in the lightweight test environment")
     def test_forward_diagnostic_reports_avoided_vocab_tensor(self):

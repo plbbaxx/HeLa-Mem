@@ -12,7 +12,7 @@ python -m hela_mem.train_qwen3_reranker_utility \
   --epochs "${QWEN3_RERANKER_EPOCHS:-5}" \
   --learning-rate "${QWEN3_RERANKER_LR:-1e-5}" \
   --train-batch-size "${QWEN3_RERANKER_TRAIN_BATCH_SIZE:-0}" \
-  --eval-batch-size "${QWEN3_RERANKER_EVAL_BATCH_SIZE:-4}" \
+  --eval-batch-size "${QWEN3_RERANKER_EVAL_BATCH_SIZE:-1}" \
   --gradient-accumulation-steps "${QWEN3_RERANKER_GRAD_ACCUM:-1}" \
   --max-length "${QWEN3_RERANKER_MAX_LENGTH:-auto}" \
   --lora-r 16 \
