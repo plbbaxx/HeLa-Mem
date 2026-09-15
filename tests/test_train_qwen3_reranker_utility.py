@@ -6,12 +6,31 @@ from hela_mem.train_qwen3_reranker_utility import (
     FullQuestionBalancedSampler,
     choose_max_length,
     reciprocal_rank,
+    trainable_parameter_report,
 )
 
 
 class FakeTokenizer:
     def encode(self, text, add_special_tokens=False):
         return list(text.encode("utf-8"))
+
+
+class FakeParameter:
+    def __init__(self, count, requires_grad):
+        self._count = count
+        self.requires_grad = requires_grad
+        self.shape = (count,)
+
+    def numel(self):
+        return self._count
+
+
+class FakeModel:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def named_parameters(self):
+        return iter(self.rows)
 
 
 class QwenUtilityTrainingTest(unittest.TestCase):
@@ -48,6 +67,22 @@ class QwenUtilityTrainingTest(unittest.TestCase):
 
     def test_reciprocal_rank_targets_max_utility_candidate(self):
         self.assertEqual(reciprocal_rank([.9, .8, .7], [0, 2, 1]), .5)
+
+    def test_parameter_audit_accepts_only_lora_trainables(self):
+        report = trainable_parameter_report(FakeModel([
+            ("base.weight", FakeParameter(1000, False)),
+            ("q_proj.lora_A.default.weight", FakeParameter(16, True)),
+            ("q_proj.lora_B.default.weight", FakeParameter(16, True)),
+        ]))
+        self.assertTrue(report["lora_only"])
+        self.assertEqual(report["trainable_parameters"], 32)
+
+    def test_parameter_audit_rejects_trainable_backbone(self):
+        with self.assertRaisesRegex(RuntimeError, "PEFT freeze invariant failed"):
+            trainable_parameter_report(FakeModel([
+                ("base.weight", FakeParameter(1000, True)),
+                ("q_proj.lora_A.default.weight", FakeParameter(16, True)),
+            ]))
 
 
 if __name__ == "__main__":

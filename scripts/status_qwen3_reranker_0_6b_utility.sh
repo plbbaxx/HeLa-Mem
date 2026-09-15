@@ -8,7 +8,7 @@ pgrep -af "hela_mem.train_qwen3_reranker_utility" || true
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader || true
 tail -n 30 "${LOG_PATH}" 2>/dev/null || true
 
-for path in config.json token_length_stats.json baseline_metrics.json train_log.jsonl dev_metrics_by_epoch.json best_checkpoint/selection.json test_metrics.json runtime_stats.json cost_comparison.json; do
+for path in config.json token_length_stats.json trainable_parameter_report.json profile_smoke_test.json baseline_metrics.json train_log.jsonl dev_metrics_by_epoch.json best_checkpoint/selection.json test_metrics.json runtime_stats.json cost_comparison.json; do
   if [[ -f "${OUTPUT_DIR}/${path}" ]]; then
     echo "OK  ${OUTPUT_DIR}/${path}"
   else

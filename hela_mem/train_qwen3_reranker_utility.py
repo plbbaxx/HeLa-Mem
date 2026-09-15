@@ -408,6 +408,58 @@ def attach_lora(model: Any, args: argparse.Namespace) -> Any:
     return get_peft_model(model, config)
 
 
+def trainable_parameter_report(model: Any) -> dict[str, Any]:
+    """Prove that PEFT froze the backbone before any forward/backward call."""
+    total = 0
+    trainable = 0
+    entries = []
+    for name, parameter in model.named_parameters():
+        count = parameter.numel()
+        total += count
+        if parameter.requires_grad:
+            trainable += count
+            entries.append({"name": name, "shape": list(parameter.shape), "numel": count})
+    non_lora = [entry["name"] for entry in entries if "lora_" not in entry["name"]]
+    report = {
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "trainable_percentage": 100 * trainable / total if total else 0.0,
+        "trainable_tensor_count": len(entries),
+        "trainable_tensors": entries,
+        "non_lora_trainable_tensors": non_lora,
+        "lora_only": bool(entries) and not non_lora,
+    }
+    print(
+        f"Parameter audit: trainable={trainable:,} total={total:,} "
+        f"ratio={report['trainable_percentage']:.6f}% tensors={len(entries)}",
+        flush=True,
+    )
+    for entry in entries:
+        print(f"TRAINABLE: {entry['name']} {entry['shape']}", flush=True)
+    if not report["lora_only"]:
+        raise RuntimeError(
+            "PEFT freeze invariant failed; expected only lora_* tensors to be trainable, "
+            f"found non-LoRA tensors: {non_lora[:20]}"
+        )
+    return report
+
+
+def cuda_memory_snapshot() -> dict[str, Any]:
+    import torch
+    free, total = torch.cuda.mem_get_info()
+    return {
+        "allocated_bytes": torch.cuda.memory_allocated(),
+        "reserved_bytes": torch.cuda.memory_reserved(),
+        "max_allocated_bytes": torch.cuda.max_memory_allocated(),
+        "device_free_bytes": free,
+        "device_total_bytes": total,
+        "allocated_gib": torch.cuda.memory_allocated() / (1024 ** 3),
+        "reserved_gib": torch.cuda.memory_reserved() / (1024 ** 3),
+        "max_allocated_gib": torch.cuda.max_memory_allocated() / (1024 ** 3),
+        "device_free_gib": free / (1024 ** 3),
+    }
+
+
 def profile_training_options(
     model: Any,
     tokenizer: Any,
@@ -438,33 +490,43 @@ def profile_training_options(
 
     def run_attempt(batch_size: int) -> dict[str, Any]:
         """Use a short-lived frame so failed autograd graphs are releasable."""
-        indexes = longest[:batch_size]
-        loader = DataLoader(Subset(dataset, indexes), batch_size=batch_size, collate_fn=collator)
-        batch = next(iter(loader))
-        pair_batch = int(batch.pop("pair_batch_size"))
-        token_count = int(batch.pop("nonpad_tokens"))
-        batch.pop("question_ids")
-        batch = {key: value.cuda(non_blocking=True) for key, value in batch.items()}
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            scores = score_batch(model, batch, yes_id, no_id)
-            loss = -functional.logsigmoid(scores[:pair_batch] - scores[pair_batch:]).mean()
-        loss.backward()
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - started
-        peak = torch.cuda.max_memory_allocated()
-        return {
-            "status": "fit",
-            "batch_size_pairs": batch_size,
-            "sequence_count": batch_size * 2,
-            "seconds_per_step": elapsed,
-            "nonpad_tokens": token_count,
-            "tokens_per_second": token_count / elapsed,
-            "peak_gpu_memory_bytes": peak,
-            "peak_gpu_memory_gib": peak / (1024 ** 3),
-        }
+        loader = iterator = batch = scores = loss = None
+        try:
+            indexes = longest[:batch_size]
+            loader = DataLoader(Subset(dataset, indexes), batch_size=batch_size, collate_fn=collator)
+            iterator = iter(loader)
+            batch = next(iterator)
+            pair_batch = int(batch.pop("pair_batch_size"))
+            token_count = int(batch.pop("nonpad_tokens"))
+            batch.pop("question_ids")
+            torch.cuda.reset_peak_memory_stats()
+            batch = {key: value.cuda(non_blocking=True) for key, value in batch.items()}
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                scores = score_batch(model, batch, yes_id, no_id)
+                loss = -functional.logsigmoid(scores[:pair_batch] - scores[pair_batch:]).mean()
+            loss.backward()
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - started
+            peak = torch.cuda.max_memory_allocated()
+            return {
+                "status": "fit",
+                "batch_size_pairs": batch_size,
+                "sequence_count": batch_size * 2,
+                "seconds_per_step": elapsed,
+                "nonpad_tokens": token_count,
+                "tokens_per_second": token_count / elapsed,
+                "peak_gpu_memory_bytes": peak,
+                "peak_gpu_memory_gib": peak / (1024 ** 3),
+            }
+        finally:
+            model.zero_grad(set_to_none=True)
+            loss = None
+            scores = None
+            batch = None
+            iterator = None
+            loader = None
 
     for checkpointing in (False, True):
         if checkpointing:
@@ -475,32 +537,76 @@ def profile_training_options(
         largest_fit = None
         for batch_size in candidates:
             cleanup()
+            torch.cuda.reset_peak_memory_stats()
+            before = cuda_memory_snapshot()
+            print(
+                f"Profile attempt: pairs={batch_size} checkpointing={checkpointing} "
+                f"allocated={before['allocated_gib']:.3f}GiB reserved={before['reserved_gib']:.3f}GiB",
+                flush=True,
+            )
             out_of_memory = False
             try:
                 result = run_attempt(batch_size)
                 result["gradient_checkpointing"] = checkpointing
-                attempts.append(result)
                 largest_fit = result
                 cleanup()
+                result["memory_before"] = before
+                result["memory_after_cleanup"] = cuda_memory_snapshot()
+                attempts.append(result)
+                print(
+                    f"Profile fit: pairs={batch_size} peak={result['peak_gpu_memory_gib']:.3f}GiB "
+                    f"after_cleanup={result['memory_after_cleanup']['allocated_gib']:.3f}GiB",
+                    flush=True,
+                )
             except RuntimeError as error:
                 if "out of memory" not in str(error).lower():
                     raise
                 message = str(error)[:500]
-                attempts.append({
+                failed = {
                     "status": "oom", "batch_size_pairs": batch_size,
                     "gradient_checkpointing": checkpointing, "error": message,
-                })
+                    "memory_before": before,
+                    "memory_at_failure": cuda_memory_snapshot(),
+                }
                 out_of_memory = True
             if out_of_memory:
                 # The exception and its traceback are now out of scope, so the
                 # failed attempt's local tensors can actually be collected.
                 cleanup()
+                failed["memory_after_cleanup"] = cuda_memory_snapshot()
+                attempts.append(failed)
+                print(
+                    f"Profile OOM cleaned: pairs={batch_size} "
+                    f"failure_allocated={failed['memory_at_failure']['allocated_gib']:.3f}GiB "
+                    f"after_cleanup={failed['memory_after_cleanup']['allocated_gib']:.3f}GiB",
+                    flush=True,
+                )
                 # Since sizes are ascending, all larger candidates are unsafe.
                 break
         if largest_fit is not None:
             return {"selected": largest_fit, "attempts": attempts}
     cleanup()
     raise RuntimeError(f"profiling found no safe training batch: {attempts}")
+
+
+def prepare_lora_profile(
+    model: Any,
+    tokenizer: Any,
+    rows: Sequence[dict[str, Any]],
+    train_pairs: Sequence[dict[str, Any]],
+    encoder: BaseTailTruncatingEncoder,
+    yes_id: int,
+    no_id: int,
+    args: argparse.Namespace,
+    output: Path | None = None,
+) -> tuple[Any, dict[str, Any], dict[str, Any]]:
+    model = attach_lora(model, args)
+    parameter_report = trainable_parameter_report(model)
+    if output is not None:
+        atomic_json(output / "trainable_parameter_report.json", parameter_report)
+    dataset = PairDataset(train_pairs, rows, encoder)
+    profile = profile_training_options(model, tokenizer, dataset, yes_id, no_id, args.train_batch_size)
+    return model, parameter_report, profile
 
 
 def run_dev_baselines(
@@ -537,9 +643,9 @@ def train(
     question_count = len({str(pair["question_id"]) for pair in train_pairs})
     if question_count != 41:
         raise RuntimeError(f"frozen eps005 train population must have 41 pair-bearing questions, got {question_count}")
-    model = attach_lora(model, args)
-    dataset = PairDataset(train_pairs, rows, encoder)
-    profile = profile_training_options(model, tokenizer, dataset, yes_id, no_id, args.train_batch_size)
+    model, parameter_report, profile = prepare_lora_profile(
+        model, tokenizer, rows, train_pairs, encoder, yes_id, no_id, args, output
+    )
     selected = profile["selected"]
     batch_size = int(selected["batch_size_pairs"])
     checkpointing = bool(selected["gradient_checkpointing"])
@@ -552,8 +658,15 @@ def train(
     batches_per_epoch = math.ceil(len(train_pairs) / batch_size)
     updates_per_epoch = math.ceil(batches_per_epoch / args.gradient_accumulation_steps)
     total_updates = updates_per_epoch * args.epochs
+    optimizer_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer_parameter_count = sum(parameter.numel() for parameter in optimizer_parameters)
+    if optimizer_parameter_count != parameter_report["trainable_parameters"]:
+        raise RuntimeError(
+            "optimizer parameter invariant failed: "
+            f"optimizer={optimizer_parameter_count}, trainable={parameter_report['trainable_parameters']}"
+        )
     optimizer = torch.optim.AdamW(
-        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        optimizer_parameters,
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -628,6 +741,8 @@ def train(
                 "dev_ndcg": dev["mean_question_ndcg"],
             })
     runtime = {
+        "trainable_parameter_report": parameter_report,
+        "optimizer_parameter_count": optimizer_parameter_count,
         "profiling": profile,
         "training": {
             "step_count": len(runtime_steps),
@@ -645,6 +760,9 @@ def train(
         "sampling": "uniform_question_then_random_pair",
         "batch_size_pairs": batch_size,
         "gradient_checkpointing": checkpointing,
+        "trainable_parameters": parameter_report["trainable_parameters"],
+        "trainable_percentage": parameter_report["trainable_percentage"],
+        "optimizer_parameter_count": optimizer_parameter_count,
         "best_epoch": best_epoch,
         "best_dev_pairwise_accuracy": best_accuracy,
         "best_checkpoint": str(best),
@@ -705,9 +823,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/mnt/disk2/caoxue/models/Qwen3-Reranker-0.6B")
     parser.add_argument("--output-dir", default="artifacts/qwen3_reranker_0_6b_utility_lora_v1")
     parser.add_argument("--historical-4b-dir", default="artifacts/memreranker_utility_lora_v1")
-    parser.add_argument("--stage", choices=("audit", "baselines", "train", "test", "all"), default="all")
+    parser.add_argument("--stage", choices=("audit", "profile", "baselines", "train", "test", "all"), default="all")
     parser.add_argument("--max-length", choices=("auto", "4096", "8192", "16384"), default="auto")
-    parser.add_argument("--train-batch-size", type=int, default=0, help="0 profiles 4, 2, 1 pairs and selects the largest safe batch")
+    parser.add_argument("--train-batch-size", type=int, default=0, help="0 profiles 1, 2, 4 pairs and selects the largest safe batch")
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
@@ -774,6 +892,25 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
     config["loaded_base_parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
     atomic_json(output / "config.json", config)
+    if args.stage == "profile":
+        base_memory = cuda_memory_snapshot()
+        profiled_model, parameter_report, profile = prepare_lora_profile(
+            model, tokenizer, rows, train_pairs, encoder, yes_id, no_id, args, output
+        )
+        smoke = {
+            "protocol": "qwen3_reranker_0_6b_lora_profile_smoke_v1",
+            "full_training_started": False,
+            "base_model_memory": base_memory,
+            "trainable_parameter_report": parameter_report,
+            "profiling": profile,
+            "selected_training_configuration": profile["selected"],
+        }
+        atomic_json(output / "profile_smoke_test.json", smoke)
+        config["profile_smoke_test"] = smoke
+        atomic_json(output / "config.json", config)
+        print(json.dumps(smoke, ensure_ascii=False, indent=2), flush=True)
+        del profiled_model
+        return
     if args.stage in ("baselines", "all"):
         baseline_path = output / "baseline_metrics.json"
         if baseline_path.exists():

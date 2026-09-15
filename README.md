@@ -344,6 +344,9 @@ Each epoch retains 472 training draws. Every draw first samples uniformly from
 the 41 questions with valid training pairs, then samples a pair within that
 question. The startup profile tests pair batch sizes 4, 2, and 1 on the longest
 examples and keeps gradient checkpointing disabled when the selected batch fits.
+Before a full run, `--stage profile` performs only the LoRA parameter audit and
+one-step forward/backward memory profiling; it does not create an optimizer or
+start training.
 
 Progress can be inspected with:
 
