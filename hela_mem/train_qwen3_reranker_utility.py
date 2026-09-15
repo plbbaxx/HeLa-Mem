@@ -290,6 +290,8 @@ def inspect_local_model(model_path: Path, tokenizer: Any, yes_id: int, no_id: in
         "token_ids_resolved_by_tokenizer": True,
         "final_valid_token_rule": "left padding; score logits at tensor position -1 after official suffix",
         "score": "yes_logit_minus_no_logit",
+        "score_implementation": "final_hidden_state_projected_to_yes_no_lm_head_rows_only",
+        "full_sequence_vocabulary_logits_materialized": False,
         "official_prefix": OFFICIAL_PREFIX,
         "official_suffix": OFFICIAL_SUFFIX,
         "instruction": UTILITY_INSTRUCTION,
@@ -297,9 +299,78 @@ def inspect_local_model(model_path: Path, tokenizer: Any, yes_id: int, no_id: in
     }
 
 
+def _causal_lm_components(model: Any) -> tuple[Any, Any]:
+    """Locate the adapter-aware decoder and LM head without running CausalLM.forward."""
+    causal_lm = model.get_base_model() if hasattr(model, "get_base_model") else model
+    decoder = getattr(causal_lm, "model", None)
+    output_embeddings = causal_lm.get_output_embeddings() if hasattr(causal_lm, "get_output_embeddings") else None
+    if decoder is None or output_embeddings is None or not hasattr(output_embeddings, "weight"):
+        raise RuntimeError(
+            "cannot locate the decoder and LM head required for final-token yes/no scoring"
+        )
+    return decoder, output_embeddings
+
+
 def score_batch(model: Any, batch: dict[str, Any], yes_id: int, no_id: int) -> Any:
-    logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits[:, -1, :]
-    return logits[:, yes_id].float() - logits[:, no_id].float()
+    """Score only yes/no at the final token; never materialize full-vocabulary logits."""
+    import torch
+    import torch.nn.functional as functional
+
+    decoder, lm_head = _causal_lm_components(model)
+    outputs = decoder(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    final_hidden = outputs.last_hidden_state[:, -1, :]
+    token_ids = torch.tensor([yes_id, no_id], device=final_hidden.device, dtype=torch.long)
+    selected_weight = lm_head.weight.index_select(0, token_ids)
+    selected_bias = None
+    if getattr(lm_head, "bias", None) is not None:
+        selected_bias = lm_head.bias.index_select(0, token_ids)
+    yes_no_logits = functional.linear(final_hidden, selected_weight, selected_bias).float()
+    return yes_no_logits[:, 0] - yes_no_logits[:, 1]
+
+
+def forward_shape_diagnostic(model: Any, batch: dict[str, Any]) -> dict[str, Any]:
+    """Describe the avoided full-logits allocation for one collated batch."""
+    import torch
+
+    _, lm_head = _causal_lm_components(model)
+    input_ids = batch["input_ids"]
+    attention_mask = batch["attention_mask"]
+    sequence_count, padded_sequence_length = map(int, input_ids.shape)
+    vocabulary_size = int(lm_head.weight.shape[0])
+    model_dtype = next(model.parameters()).dtype
+    dtype_bytes = torch.empty((), dtype=model_dtype).element_size()
+    full_shape = [sequence_count, padded_sequence_length, vocabulary_size]
+    full_elements = math.prod(full_shape)
+    full_bytes = full_elements * dtype_bytes
+    full_bf16_bytes = full_elements * 2
+    full_fp32_bytes = full_elements * 4
+    return {
+        "input_ids_shape": list(input_ids.shape),
+        "attention_mask_shape": list(attention_mask.shape),
+        "sequence_token_lengths": [int(value) for value in attention_mask.sum(dim=1).tolist()],
+        "max_token_length": int(attention_mask.sum(dim=1).max().item()),
+        "padded_sequence_length": padded_sequence_length,
+        "sequence_count": sequence_count,
+        "vocabulary_size": vocabulary_size,
+        "model_dtype": str(model_dtype),
+        "avoided_full_logits_shape": full_shape,
+        "avoided_full_logits_elements": full_elements,
+        "avoided_full_logits_bytes": full_bytes,
+        "avoided_full_logits_gib": full_bytes / (1024 ** 3),
+        "avoided_full_logits_bf16_gib": full_bf16_bytes / (1024 ** 3),
+        "avoided_full_logits_fp32_gib": full_fp32_bytes / (1024 ** 3),
+        "actual_projected_logits_shape": [sequence_count, 2],
+        "scoring_path": "decoder_last_hidden_state_then_yes_no_lm_head_rows",
+        "use_cache": False,
+        "output_hidden_states": False,
+    }
 
 
 def reciprocal_rank(scores: Sequence[float], utilities: Sequence[float]) -> float | None:
@@ -488,7 +559,30 @@ def profile_training_options(
         gc.collect()
         torch.cuda.empty_cache()
 
-    def run_attempt(batch_size: int) -> dict[str, Any]:
+    def describe_attempt(batch_size: int) -> dict[str, Any]:
+        items = [dataset[index] for index in longest[:batch_size]]
+        preview = collator(items)
+        pair_batch = int(preview.pop("pair_batch_size"))
+        preview.pop("nonpad_tokens")
+        question_ids = preview.pop("question_ids")
+        diagnostic = forward_shape_diagnostic(model, preview)
+        diagnostic["pair_batch_size"] = pair_batch
+        diagnostic["question_ids"] = question_ids
+        print(
+            "Profile batch: "
+            f"input_ids={diagnostic['input_ids_shape']} "
+            f"lengths={diagnostic['sequence_token_lengths']} "
+            f"max_length_config={dataset.encoder.max_length} "
+            f"avoided_full_logits={diagnostic['avoided_full_logits_shape']} "
+            f"(BF16={diagnostic['avoided_full_logits_bf16_gib']:.3f}GiB, "
+            f"FP32={diagnostic['avoided_full_logits_fp32_gib']:.3f}GiB)",
+            flush=True,
+        )
+        preview = None
+        items = None
+        return diagnostic
+
+    def run_attempt(batch_size: int, shape_diagnostic: dict[str, Any]) -> dict[str, Any]:
         """Use a short-lived frame so failed autograd graphs are releasable."""
         loader = iterator = batch = scores = loss = None
         try:
@@ -519,6 +613,7 @@ def profile_training_options(
                 "tokens_per_second": token_count / elapsed,
                 "peak_gpu_memory_bytes": peak,
                 "peak_gpu_memory_gib": peak / (1024 ** 3),
+                "forward_shape_diagnostic": shape_diagnostic,
             }
         finally:
             model.zero_grad(set_to_none=True)
@@ -537,6 +632,7 @@ def profile_training_options(
         largest_fit = None
         for batch_size in candidates:
             cleanup()
+            shape_diagnostic = describe_attempt(batch_size)
             torch.cuda.reset_peak_memory_stats()
             before = cuda_memory_snapshot()
             print(
@@ -546,7 +642,7 @@ def profile_training_options(
             )
             out_of_memory = False
             try:
-                result = run_attempt(batch_size)
+                result = run_attempt(batch_size, shape_diagnostic)
                 result["gradient_checkpointing"] = checkpointing
                 largest_fit = result
                 cleanup()
@@ -565,6 +661,7 @@ def profile_training_options(
                 failed = {
                     "status": "oom", "batch_size_pairs": batch_size,
                     "gradient_checkpointing": checkpointing, "error": message,
+                    "forward_shape_diagnostic": shape_diagnostic,
                     "memory_before": before,
                     "memory_at_failure": cuda_memory_snapshot(),
                 }
@@ -616,6 +713,8 @@ def run_dev_baselines(
     return {
         "protocol": "qwen3_reranker_0_6b_utility_baselines_v1",
         "score": "yes_logit_minus_no_logit",
+        "score_implementation": "final_hidden_state_projected_to_yes_no_lm_head_rows_only",
+        "full_sequence_vocabulary_logits_materialized": False,
         "test_sealed": True,
         "methods": {
             "original_qwen3_reranker_0_6b": {
@@ -898,7 +997,7 @@ def main() -> None:
             model, tokenizer, rows, train_pairs, encoder, yes_id, no_id, args, output
         )
         smoke = {
-            "protocol": "qwen3_reranker_0_6b_lora_profile_smoke_v1",
+            "protocol": "qwen3_reranker_0_6b_lora_profile_smoke_v2",
             "full_training_started": False,
             "base_model_memory": base_memory,
             "trainable_parameter_report": parameter_report,
