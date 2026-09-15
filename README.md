@@ -321,6 +321,42 @@ The expected V1.1 `eps005` training population is asserted to contain exactly
 each of those 41 questions; questions without pairs are never inserted into
 the sampler.
 
+## Qwen3-Reranker-0.6B utility ranker
+
+The 0.6B experiment is isolated from the historical MemReranker-4B trainer and
+reuses the frozen `utility_dataset_v1_1` data, `eps=0.05` preferences, and
+question-level split. It first selects a 4096/8192/16384 context cap from an
+input-length audit, preserving Question and Candidate while dropping only
+low-ranked Base memories from the tail when truncation is necessary.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export QWEN3_RERANKER_MODEL_PATH=/mnt/disk2/caoxue/models/Qwen3-Reranker-0.6B
+export UTILITY_DATASET_DIR=artifacts/utility_dataset_v1_1
+export QWEN3_RERANKER_OUTPUT_DIR=artifacts/qwen3_reranker_0_6b_utility_lora_v1
+
+mkdir -p "$QWEN3_RERANKER_OUTPUT_DIR"
+bash scripts/train_qwen3_reranker_0_6b_utility.sh --stage all \
+  2>&1 | tee "$QWEN3_RERANKER_OUTPUT_DIR/run.log"
+```
+
+Each epoch retains 472 training draws. Every draw first samples uniformly from
+the 41 questions with valid training pairs, then samples a pair within that
+question. The startup profile tests pair batch sizes 4, 2, and 1 on the longest
+examples and keeps gradient checkpointing disabled when the selected batch fits.
+
+Progress can be inspected with:
+
+```bash
+bash scripts/status_qwen3_reranker_0_6b_utility.sh
+```
+
+The root output contains `config.json`, `token_length_stats.json`,
+`baseline_metrics.json`, `train_log.jsonl`, `dev_metrics_by_epoch.json`,
+`best_checkpoint/`, `test_metrics.json`, `runtime_stats.json`, and the optional
+historical `cost_comparison.json`. No retrieval replay or final QA generation is
+performed by this module.
+
 ## Citation
 
 ```bibtex
