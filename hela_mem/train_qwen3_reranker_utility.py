@@ -856,7 +856,18 @@ def train(
             model, tokenizer, encoder, rows, dev_pairs, split_ids["dev"], yes_id, no_id,
             True, min(args.eval_batch_size, batch_size),
         )
-        epoch_row = {"epoch": epoch, "train_loss": statistics.mean(losses), **dev}
+        train_metrics = evaluate(
+            model, tokenizer, encoder, rows, train_pairs, split_ids["train"], yes_id, no_id,
+            True, min(args.eval_batch_size, batch_size),
+        )
+        epoch_row = {
+            "epoch": epoch,
+            "train_loss": statistics.mean(losses),
+            "train": train_metrics,
+            "dev": dev,
+            # Keep the historical flat dev fields for backward compatibility.
+            **dev,
+        }
         dev_history.append(epoch_row)
         atomic_json(output / "dev_metrics_by_epoch.json", dev_history)
         accuracy = float(dev["pairwise_accuracy"] or 0.0)
@@ -899,6 +910,57 @@ def train(
         "best_checkpoint": str(best),
     }
     return summary, model
+
+
+def diagnose_checkpoint(
+    base_model: Any,
+    tokenizer: Any,
+    encoder: BaseTailTruncatingEncoder,
+    rows: Sequence[dict[str, Any]],
+    pairs: Sequence[dict[str, Any]],
+    split_ids: dict[str, set[str]],
+    yes_id: int,
+    no_id: int,
+    best: Path,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Measure memorization and zero-shot deltas without retraining or touching Test."""
+    from peft import PeftModel
+
+    zero_shot_dev = evaluate(
+        base_model, tokenizer, encoder, rows, pairs, split_ids["dev"], yes_id, no_id,
+        True, batch_size,
+    )
+    tuned = PeftModel.from_pretrained(base_model, best).eval()
+    trained_train = evaluate(
+        tuned, tokenizer, encoder, rows, pairs, split_ids["train"], yes_id, no_id,
+        True, batch_size,
+    )
+    trained_dev = evaluate(
+        tuned, tokenizer, encoder, rows, pairs, split_ids["dev"], yes_id, no_id,
+        True, batch_size,
+    )
+    train_accuracy = trained_train["pairwise_accuracy"]
+    dev_accuracy = trained_dev["pairwise_accuracy"]
+    zero_accuracy = zero_shot_dev["pairwise_accuracy"]
+    return {
+        "protocol": "qwen3_reranker_0_6b_train_generalization_diagnostic_v1",
+        "test_evaluated": False,
+        "checkpoint": str(best),
+        "metrics": {
+            "trained_train": trained_train,
+            "trained_dev": trained_dev,
+            "base_conditioned_zero_shot_dev": zero_shot_dev,
+        },
+        "comparison": {
+            "train_minus_dev_pairwise_accuracy": (
+                train_accuracy - dev_accuracy if train_accuracy is not None and dev_accuracy is not None else None
+            ),
+            "trained_dev_minus_zero_shot_dev_pairwise_accuracy": (
+                dev_accuracy - zero_accuracy if dev_accuracy is not None and zero_accuracy is not None else None
+            ),
+        },
+    }
 
 
 def frozen_test(
@@ -954,7 +1016,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default="/mnt/disk2/caoxue/models/Qwen3-Reranker-0.6B")
     parser.add_argument("--output-dir", default="artifacts/qwen3_reranker_0_6b_utility_lora_v1")
     parser.add_argument("--historical-4b-dir", default="artifacts/memreranker_utility_lora_v1")
-    parser.add_argument("--stage", choices=("audit", "profile", "baselines", "train", "test", "all"), default="all")
+    parser.add_argument(
+        "--stage", choices=("audit", "profile", "baselines", "train", "diagnose", "test", "all"), default="all"
+    )
     parser.add_argument("--max-length", choices=("auto", "2048", "4096", "8192", "16384"), default="auto")
     parser.add_argument("--train-batch-size", type=int, default=0, help="0 profiles 1, 2, 4 pairs and selects the largest safe batch")
     parser.add_argument("--eval-batch-size", type=int, default=1)
@@ -1011,7 +1075,8 @@ def main() -> None:
         "lora": {"r": args.lora_r, "alpha": args.lora_alpha, "dropout": args.lora_dropout,
                  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]},
     }
-    atomic_json(output / "config.json", config)
+    config_path = output / ("diagnostic_run_config.json" if args.stage == "diagnose" else "config.json")
+    atomic_json(config_path, config)
     print(json.dumps({"scoring": scoring, "token_lengths": {key: value for key, value in auto_stats.items() if key != "samples"}}, ensure_ascii=False, indent=2), flush=True)
     if args.stage == "audit":
         return
@@ -1022,7 +1087,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     config["loaded_base_parameter_count"] = sum(parameter.numel() for parameter in model.parameters())
-    atomic_json(output / "config.json", config)
+    atomic_json(config_path, config)
     if args.stage == "profile":
         base_memory = cuda_memory_snapshot()
         profiled_model, parameter_report, profile = prepare_lora_profile(
@@ -1038,9 +1103,20 @@ def main() -> None:
         }
         atomic_json(output / "profile_smoke_test.json", smoke)
         config["profile_smoke_test"] = smoke
-        atomic_json(output / "config.json", config)
+        atomic_json(config_path, config)
         print(json.dumps(smoke, ensure_ascii=False, indent=2), flush=True)
         del profiled_model
+        return
+    if args.stage == "diagnose":
+        best = output / "best_checkpoint"
+        if not best.exists():
+            raise RuntimeError(f"Dev-selected checkpoint is missing: {best}")
+        diagnosis = diagnose_checkpoint(
+            model, tokenizer, encoder, rows, pairs, split_ids, yes_id, no_id,
+            best, args.eval_batch_size,
+        )
+        atomic_json(output / "train_dev_zero_shot_diagnostic.json", diagnosis)
+        print(json.dumps(diagnosis, ensure_ascii=False, indent=2), flush=True)
         return
     if args.stage in ("baselines", "all"):
         baseline_path = output / "baseline_metrics.json"
