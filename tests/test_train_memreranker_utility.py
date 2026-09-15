@@ -50,7 +50,7 @@ class MemRerankerUtilityTrainingTest(unittest.TestCase):
         pairs = ([{"question_id": "a"}] * 8) + ([{"question_id": "b"}] * 2)
         sampled = list(QuestionBalancedSampler(pairs, seed=3))
         counts = Counter(pairs[index]["question_id"] for index in sampled)
-        self.assertEqual(counts, {"a": 5, "b": 5})
+        self.assertEqual(counts, {"a": 1, "b": 1})
 
     def test_ranking_metrics(self):
         self.assertAlmostEqual(spearman([1, 2, 3], [10, 20, 30]), 1.0)

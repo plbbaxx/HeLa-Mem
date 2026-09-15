@@ -317,8 +317,9 @@ bash scripts/status_memreranker_utility.sh
 ```
 
 The expected V1.1 `eps005` training population is asserted to contain exactly
-41 questions with usable preference pairs. Questions without pairs are never
-inserted into the sampler.
+41 questions with usable preference pairs. Each epoch samples one pair from
+each of those 41 questions; questions without pairs are never inserted into
+the sampler.
 
 ## Citation
 

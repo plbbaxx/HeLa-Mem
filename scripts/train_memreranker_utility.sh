@@ -10,7 +10,7 @@ python -m hela_mem.train_memreranker_utility \
   --max-length "${MEMRERANKER_MAX_LENGTH:-16384}" \
   --train-batch-size "${MEMRERANKER_TRAIN_BATCH_SIZE:-1}" \
   --eval-batch-size "${MEMRERANKER_EVAL_BATCH_SIZE:-1}" \
-  --gradient-accumulation-steps "${MEMRERANKER_GRAD_ACCUM:-8}" \
+  --gradient-accumulation-steps "${MEMRERANKER_GRAD_ACCUM:-1}" \
   --epochs "${MEMRERANKER_EPOCHS:-5}" \
   --learning-rate "${MEMRERANKER_LR:-1e-5}" \
   --lora-r 16 \

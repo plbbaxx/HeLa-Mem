@@ -175,7 +175,7 @@ def load_dataset(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
 
 
 class QuestionBalancedSampler:
-    """Sample exactly ``len(pairs)`` items while cycling uniformly over questions."""
+    """Sample one pair from every eligible question, uniformly per epoch."""
 
     def __init__(self, pairs: Sequence[dict[str, Any]], seed: int, epoch: int = 0) -> None:
         grouped: dict[str, list[int]] = defaultdict(list)
@@ -186,7 +186,10 @@ class QuestionBalancedSampler:
         self.grouped = dict(grouped)
         self.seed = seed
         self.epoch = epoch
-        self.num_samples = len(pairs)
+        # The locked protocol defines one sampled preference per eligible
+        # question in each epoch.  It is intentionally *not* one pass through
+        # all 472 pairs, otherwise questions with many pairs dominate exposure.
+        self.num_samples = len(self.grouped)
 
     def __len__(self) -> int:
         return self.num_samples
@@ -461,7 +464,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=16384)
     parser.add_argument("--train-batch-size", type=int, default=1)
     parser.add_argument("--eval-batch-size", type=int, default=1)
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--warmup-ratio", type=float, default=.1)
