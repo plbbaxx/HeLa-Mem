@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 python -m hela_mem.train_qwen3_reranker_utility \
   --dataset-dir "${UTILITY_DATASET_DIR:-artifacts/utility_dataset_v1_1}" \

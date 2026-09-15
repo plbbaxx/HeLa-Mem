@@ -417,6 +417,7 @@ def profile_training_options(
     requested_batch_size: int,
 ) -> dict[str, Any]:
     """Pick the largest safe batch and prefer checkpointing OFF."""
+    import gc
     import torch
     import torch.nn.functional as functional
     from torch.utils.data import DataLoader, Subset
@@ -424,58 +425,81 @@ def profile_training_options(
     longest = sorted(range(len(dataset)), key=lambda index: max(
         len(dataset[index]["preferred"]), len(dataset[index]["rejected"])
     ), reverse=True)
-    candidates = [requested_batch_size] if requested_batch_size > 0 else [4, 2, 1]
+    # Probe upwards.  A large failed allocation must never poison the smaller
+    # configurations that are expected to fit on the same device.
+    candidates = [requested_batch_size] if requested_batch_size > 0 else [1, 2, 4]
     attempts = []
     collator = DynamicPairCollator(tokenizer)
+
+    def cleanup() -> None:
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def run_attempt(batch_size: int) -> dict[str, Any]:
+        """Use a short-lived frame so failed autograd graphs are releasable."""
+        indexes = longest[:batch_size]
+        loader = DataLoader(Subset(dataset, indexes), batch_size=batch_size, collate_fn=collator)
+        batch = next(iter(loader))
+        pair_batch = int(batch.pop("pair_batch_size"))
+        token_count = int(batch.pop("nonpad_tokens"))
+        batch.pop("question_ids")
+        batch = {key: value.cuda(non_blocking=True) for key, value in batch.items()}
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            scores = score_batch(model, batch, yes_id, no_id)
+            loss = -functional.logsigmoid(scores[:pair_batch] - scores[pair_batch:]).mean()
+        loss.backward()
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        peak = torch.cuda.max_memory_allocated()
+        return {
+            "status": "fit",
+            "batch_size_pairs": batch_size,
+            "sequence_count": batch_size * 2,
+            "seconds_per_step": elapsed,
+            "nonpad_tokens": token_count,
+            "tokens_per_second": token_count / elapsed,
+            "peak_gpu_memory_bytes": peak,
+            "peak_gpu_memory_gib": peak / (1024 ** 3),
+        }
+
     for checkpointing in (False, True):
         if checkpointing:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             model.enable_input_require_grads()
         else:
             model.gradient_checkpointing_disable()
+        largest_fit = None
         for batch_size in candidates:
-            indexes = longest[:batch_size]
-            if len(indexes) < batch_size:
-                continue
-            loader = DataLoader(Subset(dataset, indexes), batch_size=batch_size, collate_fn=collator)
+            cleanup()
+            out_of_memory = False
             try:
-                batch = next(iter(loader))
-                pair_batch = int(batch.pop("pair_batch_size"))
-                token_count = int(batch.pop("nonpad_tokens"))
-                batch.pop("question_ids")
-                batch = {key: value.cuda(non_blocking=True) for key, value in batch.items()}
-                torch.cuda.empty_cache()
-                torch.cuda.reset_peak_memory_stats()
-                torch.cuda.synchronize()
-                started = time.perf_counter()
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    scores = score_batch(model, batch, yes_id, no_id)
-                    loss = -functional.logsigmoid(scores[:pair_batch] - scores[pair_batch:]).mean()
-                loss.backward()
-                torch.cuda.synchronize()
-                elapsed = time.perf_counter() - started
-                peak = torch.cuda.max_memory_allocated()
-                model.zero_grad(set_to_none=True)
-                result = {
-                    "status": "fit",
-                    "batch_size_pairs": batch_size,
-                    "sequence_count": batch_size * 2,
-                    "gradient_checkpointing": checkpointing,
-                    "seconds_per_step": elapsed,
-                    "nonpad_tokens": token_count,
-                    "tokens_per_second": token_count / elapsed,
-                    "peak_gpu_memory_bytes": peak,
-                    "peak_gpu_memory_gib": peak / (1024 ** 3),
-                }
+                result = run_attempt(batch_size)
+                result["gradient_checkpointing"] = checkpointing
                 attempts.append(result)
-                return {"selected": result, "attempts": attempts}
-            except torch.cuda.OutOfMemoryError as error:
-                model.zero_grad(set_to_none=True)
-                torch.cuda.empty_cache()
+                largest_fit = result
+                cleanup()
+            except RuntimeError as error:
+                if "out of memory" not in str(error).lower():
+                    raise
+                message = str(error)[:500]
                 attempts.append({
                     "status": "oom", "batch_size_pairs": batch_size,
-                    "gradient_checkpointing": checkpointing, "error": str(error)[:500],
+                    "gradient_checkpointing": checkpointing, "error": message,
                 })
+                out_of_memory = True
+            if out_of_memory:
+                # The exception and its traceback are now out of scope, so the
+                # failed attempt's local tensors can actually be collected.
+                cleanup()
+                # Since sizes are ascending, all larger candidates are unsafe.
+                break
+        if largest_fit is not None:
+            return {"selected": largest_fit, "attempts": attempts}
+    cleanup()
     raise RuntimeError(f"profiling found no safe training batch: {attempts}")
 
 
