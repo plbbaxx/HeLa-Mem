@@ -1,3 +1,4 @@
+import copy
 import json
 import sys
 import tempfile
@@ -9,8 +10,13 @@ from unittest.mock import patch
 
 import numpy as np
 
-# The workstation has the legacy OpenAI package; production requires openai>=1.
-if not hasattr(__import__("openai"), "OpenAI"):
+# The workstation may have no OpenAI package or the legacy package; production
+# requires openai>=1, while these unit tests patch every external call.
+try:
+    openai_module = __import__("openai")
+except ImportError:
+    openai_module = None
+if openai_module is None or not hasattr(openai_module, "OpenAI"):
     module = types.ModuleType("openai")
     module.OpenAI = object
     sys.modules["openai"] = module
@@ -100,11 +106,68 @@ class ReproPipelineTest(unittest.TestCase):
                     query_embedding_override=np.array([1.0, 0.0]),
                     current_time_override="2026-01-02 00:00:00",
                     edge_weight_multipliers={("0", "1"): 2.0},
-                    reinforce=False,
+                    update_graph=False,
                 )
             self.assertEqual(before, {source: dict(neighbors) for source, neighbors in graph.edges.items()})
             self.assertFalse(graph.last_retrieval_trace["reinforcement_enabled"])
             self.assertTrue(graph.last_retrieval_trace["edge_weight_calibration_enabled"])
+
+    def test_frozen_retrieval_is_repeatable_and_does_not_mutate_edges(self):
+        with tempfile.TemporaryDirectory() as temp:
+            graph = HebbianMemoryGraph(str(Path(temp) / "memory.json"))
+            graph.nodes = {
+                "0": {"id": "0", "content": "a", "embedding": [1.0, 0.0], "timestamp": "2026-01-01", "keywords": []},
+                "1": {"id": "1", "content": "b", "embedding": [0.8, 0.2], "timestamp": "2026-01-01", "keywords": []},
+                "2": {"id": "2", "content": "c", "embedding": [0.0, 1.0], "timestamp": "2026-01-01", "keywords": []},
+            }
+            graph.add_edge("0", "2", weight=0.5, bidirectional=True)
+            before = copy.deepcopy(graph.edges)
+            kwargs = dict(
+                top_k=2,
+                query_keywords_override=set(),
+                query_embedding_override=np.array([1.0, 0.0]),
+                current_time_override="2026-01-02 00:00:00",
+                update_graph=False,
+            )
+            with patch("hela_mem.hebbian_memory.compute_time_decay", lambda *args: 1.0):
+                first = graph.retrieve("query", **kwargs)
+                first_trace = copy.deepcopy(graph.last_retrieval_trace)
+                second = graph.retrieve("query", **kwargs)
+                second_trace = copy.deepcopy(graph.last_retrieval_trace)
+            self.assertEqual([row["node"]["id"] for row in first], [row["node"]["id"] for row in second])
+            self.assertEqual([row["score"] for row in first], [row["score"] for row in second])
+            self.assertEqual(first_trace["final_scores"], second_trace["final_scores"])
+            self.assertEqual(before, graph.edges)
+            self.assertFalse(second_trace["reinforcement_enabled"])
+
+    def test_default_and_explicit_update_graph_preserve_reinforcement(self):
+        def make_graph(path):
+            graph = HebbianMemoryGraph(str(path))
+            graph.nodes = {
+                "0": {"id": "0", "content": "a", "embedding": [1.0, 0.0], "timestamp": "2026-01-01", "keywords": []},
+                "1": {"id": "1", "content": "b", "embedding": [0.9, 0.1], "timestamp": "2026-01-01", "keywords": []},
+            }
+            return graph
+
+        with tempfile.TemporaryDirectory() as temp:
+            default_graph = make_graph(Path(temp) / "default.json")
+            explicit_graph = make_graph(Path(temp) / "explicit.json")
+            kwargs = dict(
+                top_k=2,
+                query_keywords_override=set(),
+                query_embedding_override=np.array([1.0, 0.0]),
+                current_time_override="2026-01-02 00:00:00",
+            )
+            with patch("hela_mem.hebbian_memory.compute_time_decay", lambda *args: 1.0):
+                default_results = default_graph.retrieve("query", **kwargs)
+                explicit_results = explicit_graph.retrieve("query", update_graph=True, **kwargs)
+            self.assertEqual(
+                [row["node"]["id"] for row in default_results],
+                [row["node"]["id"] for row in explicit_results],
+            )
+            self.assertEqual(default_graph.edges, explicit_graph.edges)
+            self.assertGreater(default_graph.edges["0"]["1"], 0.0)
+            self.assertTrue(default_graph.last_retrieval_trace["reinforcement_enabled"])
 
     def test_five_items_resume_and_eval_schema(self):
         with tempfile.TemporaryDirectory() as temp:

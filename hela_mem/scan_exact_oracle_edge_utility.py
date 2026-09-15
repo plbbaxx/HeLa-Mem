@@ -130,7 +130,7 @@ def process_item(
         query_keywords_override=query_keywords,
         query_embedding_override=query_embedding,
         current_time_override=paired_time,
-        reinforce=False,
+        update_graph=False,
     )
     baseline_trace = compact_trace(copy.deepcopy(graph.last_retrieval_trace or {}))
     current_prediction = {
@@ -152,7 +152,7 @@ def process_item(
         query_embedding_override=query_embedding,
         current_time_override=paired_time,
         edge_weight_multipliers=edge_multipliers,
-        reinforce=False,
+        update_graph=False,
     )
     oracle_trace = compact_trace(copy.deepcopy(graph.last_retrieval_trace or {}))
     baseline_flipped = baseline_trace["flipped_memory_ids"]

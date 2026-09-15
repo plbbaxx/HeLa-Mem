@@ -238,7 +238,7 @@ def replay_item(
         query_embedding_override=get_embedding(item["question"]),
         current_time_override=v05["paired_current_time"],
         edge_weight_multipliers=multipliers,
-        reinforce=False,
+        update_graph=False,
     )
     automatic_trace = compact_trace(graph.last_retrieval_trace or {})
     if automatic_trace["base_top_k_ids"] != current_base_ids:

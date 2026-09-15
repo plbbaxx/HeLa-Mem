@@ -126,7 +126,10 @@ def analyze(
     one_hop_seed_k: int,
     one_hop_neighbor_k: int,
     quality: dict[str, dict[str, str]],
+    update_graph: bool = False,
 ) -> dict[str, Any]:
+    if update_graph:
+        raise ValueError("offline PPR replay must run with update_graph=False")
     records = []
     missing_graphs = []
     invalid_personalization = []
@@ -206,6 +209,9 @@ def analyze(
     report = {
         "protocol": "ppr_associative_expansion_diagnostic_v1",
         "offline_only": True,
+        "update_graph": False,
+        "retrieve_calls": 0,
+        "graph_write_calls": 0,
         "qa_generation_calls": 0,
         "judge_calls": 0,
         "reencoding_performed": False,
@@ -254,6 +260,7 @@ def main() -> None:
     report = analyze(
         dataset, predictions, Path(args.mem_dir), args.top_k, args.ppr_damping, args.ppr_top_n,
         args.one_hop_seed_k, args.one_hop_neighbor_k, load_quality_labels(quality_path),
+        update_graph=False,
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

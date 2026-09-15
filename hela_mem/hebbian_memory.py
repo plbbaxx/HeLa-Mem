@@ -238,14 +238,21 @@ class HebbianMemoryGraph:
         query_embedding_override=None,
         current_time_override=None,
         edge_weight_multipliers=None,
-        reinforce=True,
+        update_graph: bool = True,
+        reinforce=None,
     ):
         """
         [NEW] Hebbian Retrieval: Vector Similarity + Spreading Activation + Time Decay + Keyword Matching
         Improvements:
         1. Time Decay: Older memories are penalized.
         2. Keyword Matching: Nodes with matching keywords get a boost.
+
+        ``update_graph=False`` makes retrieval read-only and is required for
+        offline replay/diagnostics.  ``reinforce`` is retained as a deprecated
+        compatibility alias for older callers and, when supplied, overrides
+        ``update_graph``.
         """
+        effective_update_graph = bool(update_graph if reinforce is None else reinforce)
         if not self.nodes:
             return []
 
@@ -441,7 +448,7 @@ class HebbianMemoryGraph:
             "flipped_memory_ids_after": [node_ids[idx] for idx in flipped_indices],
             "query_keywords": sorted(query_keywords),
             "edge_weight_calibration_enabled": edge_weight_multipliers is not None,
-            "reinforcement_enabled": bool(reinforce),
+            "reinforcement_enabled": effective_update_graph,
         }
         if self.ppr_expand:
             self.last_retrieval_trace.update({
@@ -508,7 +515,7 @@ class HebbianMemoryGraph:
             print(f"  [Spreading] {spreading_flipped_count}/{max_flipped} flipped added.")
             
         # 4. Hebbian Learning
-        if reinforce:
+        if effective_update_graph:
             self.reinforce_memory_cluster(retrieved_ids)
             
         return results
