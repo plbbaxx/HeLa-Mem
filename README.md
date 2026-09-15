@@ -286,6 +286,40 @@ LoCoMo evaluation reports F1 and BLEU-1 overall, by sample, and by question cate
 - The code uses the standard OpenAI Python SDK request pattern (`client.chat.completions.create`) with `OPENAI_API_KEY` and the official OpenAI base URL by default.
 - The repository has been cleaned for release, but the benchmark paths are kept source-aligned rather than simplified.
 
+## Base-conditioned MemReranker utility training
+
+The utility dataset V1.1 can be used to train a deployable marginal-utility
+reranker without rebuilding memories or running answer generation. The formal
+pipeline evaluates two frozen baselines on Dev, trains a question-balanced
+pairwise LoRA on `eps=0.05`, selects the checkpoint using Dev pairwise accuracy,
+and only then evaluates all three frozen methods on Test once.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+export MEMRERANKER_MODEL_PATH=/mnt/disk2/caoxue/models/MemReranker-4B
+export UTILITY_DATASET_DIR=artifacts/utility_dataset_v1_1
+export MEMRERANKER_OUTPUT_DIR=artifacts/memreranker_utility_lora_v1
+
+bash scripts/train_memreranker_utility.sh --stage all \
+  2>&1 | tee "$MEMRERANKER_OUTPUT_DIR/run.log"
+```
+
+The input-length audit is always written before model training. `max_length`
+is 16384, batches use dynamic left padding, and the official MemReranker
+prefix/suffix plus tokenizer-resolved `yes`/`no` IDs are recorded in
+`run_config.json`. The final Test result is protected from accidental reruns;
+`--force-test` is required to overwrite it deliberately.
+
+Progress can be inspected from another shell:
+
+```bash
+bash scripts/status_memreranker_utility.sh
+```
+
+The expected V1.1 `eps005` training population is asserted to contain exactly
+41 questions with usable preference pairs. Questions without pairs are never
+inserted into the sampler.
+
 ## Citation
 
 ```bibtex
