@@ -138,12 +138,20 @@ def compact_retrieval(results: list) -> list:
     compact = []
     for result in results:
         node = result.get("node", {})
-        compact.append({
+        row = {
             "node_id": node.get("id"), "content": node.get("content", ""),
             "timestamp": node.get("timestamp", ""), "score": result.get("score"),
             "base_score": result.get("base_score"), "source": result.get("source"),
             "flipped_by_spreading": result.get("flipped_by_spreading", False),
-        })
+        }
+        if result.get("source") == "ppr":
+            row.update({
+                "ppr_score": result.get("ppr_score"),
+                "ppr_hop_distance": result.get("ppr_hop_distance"),
+                "ppr_strongest_predecessor": result.get("ppr_strongest_predecessor"),
+                "ppr_hebbian_path": result.get("ppr_hebbian_path"),
+            })
+        compact.append(row)
     return compact
 
 
@@ -363,7 +371,10 @@ def answer_question(
 
     # Build episodic context
     context_blocks = []
-    for res in results[:top_k]:
+    # PPR mode explicitly defines Base Top-K UNION PPR Top-N as its candidate
+    # context.  Disabled mode retains the historical slice exactly.
+    episodic_results = results if retriever.graph.ppr_expand else results[:top_k]
+    for res in episodic_results:
         node = res["node"]
         score = res["score"]
         source_label = "Direct Match" if res.get("base_score", 0) > 0.6 else "Associative Memory"
@@ -615,6 +626,12 @@ def eval_longmemeval(
           f"inhibition={os.environ.get('HEBBIAN_USE_INHIBITION', 'false')}, "
           f"beta={os.environ.get('HEBBIAN_INHIBITION_BETA', '0.15')}, "
           f"top_m={os.environ.get('HEBBIAN_INHIBITION_TOP_M', '7')}")
+    ppr_enabled = os.environ.get("HEBBIAN_PPR_EXPAND", "false").lower() == "true"
+    if ppr_enabled:
+        print(
+            f"PPR expansion: damping={os.environ.get('HEBBIAN_PPR_DAMPING', '0.5')}, "
+            f"top_n={os.environ.get('HEBBIAN_PPR_TOP_N', '10')}"
+        )
     print("=" * 70)
 
     # Load dataset
@@ -635,7 +652,7 @@ def eval_longmemeval(
     # Evaluate items in parallel
     all_results = []
     pending = []
-    fingerprint = config_fingerprint({
+    fingerprint_values = {
         "dataset_sha256": sha256_file(data_path),
         "generation_model": model_for("generation"),
         "judge_model": model_for("judge"),
@@ -645,7 +662,14 @@ def eval_longmemeval(
         "use_inhibition": os.environ.get("HEBBIAN_USE_INHIBITION", "false").lower() == "true",
         "inhibition_beta": os.environ.get("HEBBIAN_INHIBITION_BETA", "0.15"),
         "inhibition_top_m": os.environ.get("HEBBIAN_INHIBITION_TOP_M", "7"),
-    })
+    }
+    if ppr_enabled:
+        fingerprint_values.update({
+            "ppr_expand": True,
+            "ppr_damping": os.environ.get("HEBBIAN_PPR_DAMPING", "0.5"),
+            "ppr_top_n": os.environ.get("HEBBIAN_PPR_TOP_N", "10"),
+        })
+    fingerprint = config_fingerprint(fingerprint_values)
     for i, item in enumerate(items):
         result_path = os.path.join(results_dir, f"result_{item['question_id']}.json")
         cached = read_valid_json(result_path, ("question_id", "status", "prediction", "judge_result")) if resume else None
@@ -754,6 +778,12 @@ def eval_longmemeval(
         },
         "results": all_results,
     }
+    if ppr_enabled:
+        summary["params"].update({
+            "ppr_expand": True,
+            "ppr_damping": os.environ.get("HEBBIAN_PPR_DAMPING", "0.5"),
+            "ppr_top_n": os.environ.get("HEBBIAN_PPR_TOP_N", "10"),
+        })
 
     summary_path = os.path.join(results_dir, "eval_summary.json")
     atomic_write_json(summary_path, summary)
@@ -805,6 +835,9 @@ def main() -> None:
     parser.add_argument("--use-inhibition", action="store_true")
     parser.add_argument("--inhibition-beta", type=float, default=0.15)
     parser.add_argument("--inhibition-top-m", type=int, default=7)
+    parser.add_argument("--ppr-expand", action="store_true")
+    parser.add_argument("--ppr-damping", type=float, default=0.5)
+    parser.add_argument("--ppr-top-n", type=int, default=10)
 
     args = parser.parse_args()
 
@@ -812,6 +845,9 @@ def main() -> None:
     os.environ["HEBBIAN_USE_INHIBITION"] = str(args.use_inhibition).lower()
     os.environ["HEBBIAN_INHIBITION_BETA"] = str(args.inhibition_beta)
     os.environ["HEBBIAN_INHIBITION_TOP_M"] = str(args.inhibition_top_m)
+    os.environ["HEBBIAN_PPR_EXPAND"] = str(args.ppr_expand).lower()
+    os.environ["HEBBIAN_PPR_DAMPING"] = str(args.ppr_damping)
+    os.environ["HEBBIAN_PPR_TOP_N"] = str(args.ppr_top_n)
 
     eval_longmemeval(
         data_path=args.data_path,

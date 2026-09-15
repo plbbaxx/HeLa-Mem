@@ -3,6 +3,7 @@ import numpy as np
 import os
 from collections import defaultdict
 from .utils import get_timestamp, get_embedding, normalize_vector, compute_time_decay, llm_extract_keywords
+from .ppr_expansion import ppr_associative_candidates
 
 
 def apply_lateral_inhibition(activation_scores, beta=0.15, top_m=7):
@@ -49,6 +50,11 @@ class HebbianMemoryGraph:
         self.use_inhibition = os.environ.get("HEBBIAN_USE_INHIBITION", "false").lower() == "true"
         self.inhibition_beta = float(os.environ.get("HEBBIAN_INHIBITION_BETA", "0.15"))
         self.inhibition_top_m = int(os.environ.get("HEBBIAN_INHIBITION_TOP_M", "7"))
+        self.ppr_expand = os.environ.get("HEBBIAN_PPR_EXPAND", "false").lower() == "true"
+        self.ppr_damping = float(os.environ.get("HEBBIAN_PPR_DAMPING", "0.5"))
+        self.ppr_top_n = int(os.environ.get("HEBBIAN_PPR_TOP_N", "10"))
+        self.ppr_max_iter = int(os.environ.get("HEBBIAN_PPR_MAX_ITER", "50"))
+        self.ppr_tol = float(os.environ.get("HEBBIAN_PPR_TOL", "1e-6"))
         self.last_retrieval_trace = None
         
         print(f"[Hebbian] Initialized with: LR={self.learning_rate}, Decay={self.decay_rate}, Alpha={self.activation_alpha}, Threshold={self.spreading_threshold}, MaxFlipped={self.max_flipped}")
@@ -397,6 +403,30 @@ class HebbianMemoryGraph:
                     if len(flipped_before) >= max_flipped:
                         break
 
+        # Optional HippoRAG-style PPR candidate generation.  The restart mass
+        # is restricted to the unchanged Base Top-K and weighted by its raw
+        # non-negative query activation.  PPR controls pool membership only;
+        # the existing inhibited spreading score still controls presentation.
+        ppr_trace = None
+        ppr_by_id = {}
+        if self.ppr_expand:
+            ppr_trace = ppr_associative_candidates(
+                node_ids=node_ids,
+                edges=self.edges,
+                base_ids=[node_ids[idx] for idx in base_indices],
+                base_scores={node_ids[idx]: float(base_activations[idx]) for idx in base_indices},
+                top_n=self.ppr_top_n,
+                damping=self.ppr_damping,
+                max_iter=self.ppr_max_iter,
+                tol=self.ppr_tol,
+            )
+            ppr_by_id = {row["node_id"]: row for row in ppr_trace["candidates"]}
+            ppr_candidate_indices = [id_to_idx[row["node_id"]] for row in ppr_trace["candidates"]]
+            flipped_indices = sorted(
+                ppr_candidate_indices,
+                key=lambda idx: (-float(inhibited_scores[idx]), node_ids[idx]),
+            )
+
         self.last_retrieval_trace = {
             "use_inhibition": self.use_inhibition,
             "inhibition_beta": self.inhibition_beta,
@@ -413,6 +443,15 @@ class HebbianMemoryGraph:
             "edge_weight_calibration_enabled": edge_weight_multipliers is not None,
             "reinforcement_enabled": bool(reinforce),
         }
+        if self.ppr_expand:
+            self.last_retrieval_trace.update({
+                "ppr_expand": True,
+                "ppr_damping": self.ppr_damping,
+                "ppr_top_n": self.ppr_top_n,
+                "ppr_max_iter": self.ppr_max_iter,
+                "ppr_tol": self.ppr_tol,
+                "ppr_trace": ppr_trace,
+            })
         
         # Combine: Base + Flipped (no fill-up)
         top_indices = base_indices + flipped_indices
@@ -444,17 +483,28 @@ class HebbianMemoryGraph:
             score = inhibited_scores[idx]
             recency = compute_time_decay(node["timestamp"], current_time)
             
-            results.append({
+            ppr_row = ppr_by_id.get(nid)
+            result = {
                 "node": node,
                 "score": float(score),
                 "base_score": float(base_activations[idx]),
-                "flipped_by_spreading": True,
-                "source": "hebbian",  # [NEW] Mark as hebbian flipped
+                "flipped_by_spreading": not self.ppr_expand,
+                "source": "ppr" if self.ppr_expand else "hebbian",
                 "recency": recency
-            })
+            }
+            if ppr_row:
+                result.update({
+                    "ppr_score": ppr_row["ppr_score"],
+                    "ppr_hop_distance": ppr_row["hop_distance"],
+                    "ppr_strongest_predecessor": ppr_row["strongest_predecessor"],
+                    "ppr_hebbian_path": ppr_row["hebbian_path"],
+                })
+            results.append(result)
             retrieved_ids.append(nid)
         
-        if self.activation_alpha > 0 and spreading_flipped_count > 0:
+        if self.ppr_expand and spreading_flipped_count > 0:
+            print(f"  [PPR] {spreading_flipped_count}/{self.ppr_top_n} associative candidates added.")
+        elif self.activation_alpha > 0 and spreading_flipped_count > 0:
             print(f"  [Spreading] {spreading_flipped_count}/{max_flipped} flipped added.")
             
         # 4. Hebbian Learning
