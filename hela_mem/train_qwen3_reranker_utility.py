@@ -703,9 +703,9 @@ def profile_training_options(
                     )
                     break
             if largest_fit is not None:
-                return {"selected": largest_fit, "attempts": attempts}
+                return {"overall_status": "fit", "selected": largest_fit, "attempts": attempts}
     cleanup()
-    raise RuntimeError(f"profiling found no safe training batch: {attempts}")
+    return {"overall_status": "oom", "selected": None, "attempts": attempts}
 
 
 def prepare_lora_profile(
@@ -769,6 +769,10 @@ def train(
     )
     dataset = PairDataset(train_pairs, rows, encoder)
     selected = profile["selected"]
+    if selected is None:
+        raise RuntimeError(
+            "profiling found no safe training configuration; run --stage profile and inspect profile_smoke_test.json"
+        )
     batch_size = int(selected["batch_size_pairs"])
     checkpointing = bool(selected["gradient_checkpointing"])
     pair_forward_mode = str(selected["pair_forward_mode"])
@@ -951,7 +955,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="artifacts/qwen3_reranker_0_6b_utility_lora_v1")
     parser.add_argument("--historical-4b-dir", default="artifacts/memreranker_utility_lora_v1")
     parser.add_argument("--stage", choices=("audit", "profile", "baselines", "train", "test", "all"), default="all")
-    parser.add_argument("--max-length", choices=("auto", "4096", "8192", "16384"), default="auto")
+    parser.add_argument("--max-length", choices=("auto", "2048", "4096", "8192", "16384"), default="auto")
     parser.add_argument("--train-batch-size", type=int, default=0, help="0 profiles 1, 2, 4 pairs and selects the largest safe batch")
     parser.add_argument("--eval-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -1025,7 +1029,7 @@ def main() -> None:
             model, tokenizer, rows, train_pairs, encoder, yes_id, no_id, args, output
         )
         smoke = {
-            "protocol": "qwen3_reranker_0_6b_lora_profile_smoke_v2",
+            "protocol": "qwen3_reranker_0_6b_lora_profile_smoke_v3",
             "full_training_started": False,
             "base_model_memory": base_memory,
             "trainable_parameter_report": parameter_report,
