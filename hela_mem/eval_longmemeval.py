@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional, Tuple
 from .hebbian_memory import HebbianMemoryGraph
 from .hebbian_retriever import HebbianRetriever
 from .hebbian_knowledge_memory import HebbianKnowledgeMemory
+from .raw_actr_retriever import RawACTRRetriever, summarize_fans
 from .utils import (
     gpt_generate_answer_with_rotation,
 )
@@ -151,6 +152,8 @@ def compact_retrieval(results: list) -> list:
                 "ppr_strongest_predecessor": result.get("ppr_strongest_predecessor"),
                 "ppr_hebbian_path": result.get("ppr_hebbian_path"),
             })
+        if result.get("source") in {"raw", "cue_idf", "actr"}:
+            row["actr_activation"] = result.get("actr_activation")
         compact.append(row)
     return compact
 
@@ -359,21 +362,42 @@ def answer_question(
     knowledge_memory: Optional[HebbianKnowledgeMemory] = None,
     semantic_top_k: int = 5,
     item_id: str = "",
-) -> Tuple[str, list, list]:
+    retrieval_mode: str = "hebbian",
+    actr_candidate_k: int = 30,
+    actr_fan_threshold: float = 0.5,
+    actr_score_mode: str = "actr",
+    actr_alpha: float = 0.5,
+) -> Tuple[str, list, list, Optional[dict]]:
     """
     Answer a single LongMemEval question using Hebbian retrieval.
 
     Returns:
         (answer_text, retrieved_results)
     """
-    # 1. Episodic retrieval
-    results = retriever.graph.retrieve(question, top_k=top_k)
+    # 1. Episodic retrieval. Raw modes are read-only and share one whole-query
+    # Top-N pool; only their ranking signal differs.
+    raw_diagnostic = None
+    if retrieval_mode == "hebbian":
+        results = retriever.graph.retrieve(question, top_k=top_k)
+    else:
+        raw_retriever = RawACTRRetriever(retriever.graph)
+        results = raw_retriever.retrieve(
+            query=question,
+            mode=retrieval_mode,
+            candidate_k=actr_candidate_k,
+            top_k=top_k,
+            fan_threshold=actr_fan_threshold,
+            score_mode=actr_score_mode,
+            alpha=actr_alpha,
+            question_id=item_id,
+        )
+        raw_diagnostic = raw_retriever.last_diagnostic
 
     # Build episodic context
     context_blocks = []
     # PPR mode explicitly defines Base Top-K UNION PPR Top-N as its candidate
     # context.  Disabled mode retains the historical slice exactly.
-    episodic_results = results if retriever.graph.ppr_expand else results[:top_k]
+    episodic_results = results if retrieval_mode != "hebbian" or retriever.graph.ppr_expand else results[:top_k]
     for res in episodic_results:
         node = res["node"]
         score = res["score"]
@@ -390,7 +414,7 @@ def answer_question(
     # 2. Semantic retrieval from Knowledge Memory
     knowledge_text = ""
     kb_results = []
-    if knowledge_memory:
+    if retrieval_mode == "hebbian" and knowledge_memory:
         try:
             kb_results = knowledge_memory.search_knowledge(question, top_k=semantic_top_k)
             if kb_results:
@@ -401,12 +425,12 @@ def answer_question(
 
     # 3. Get user profile
     profile_text = "None"
-    if knowledge_memory and hasattr(knowledge_memory, "get_raw_user_profile"):
+    if retrieval_mode == "hebbian" and knowledge_memory and hasattr(knowledge_memory, "get_raw_user_profile"):
         profile_text = knowledge_memory.get_raw_user_profile(item_id) or "None"
 
     # 4. Get assistant knowledge
     assistant_knowledge_text = ""
-    if knowledge_memory and hasattr(knowledge_memory, "get_assistant_knowledge"):
+    if retrieval_mode == "hebbian" and knowledge_memory and hasattr(knowledge_memory, "get_assistant_knowledge"):
         try:
             ak_list = knowledge_memory.get_assistant_knowledge()
             if ak_list:
@@ -431,7 +455,7 @@ def answer_question(
 
     with llm_scope("answer_generation_calls"):
         response = gpt_generate_answer_with_rotation(user_prompt, messages, role="generation")
-    return response, results, kb_results
+    return response, results, kb_results, raw_diagnostic
 
 
 # ========== Single Item Evaluation ==========
@@ -445,6 +469,11 @@ def evaluate_single_item(
     use_consolidation: bool = False,
     results_dir: Optional[str] = None,
     fingerprint: str = "",
+    retrieval_mode: str = "hebbian",
+    actr_candidate_k: int = 30,
+    actr_fan_threshold: float = 0.5,
+    actr_score_mode: str = "actr",
+    actr_alpha: float = 0.5,
 ) -> Dict[str, Any]:
     """
     Evaluate a single LongMemEval item.
@@ -489,6 +518,8 @@ def evaluate_single_item(
             "config_fingerprint": fingerprint,
             "is_corrupted": True,
             "eval_time": 0.0,
+            "retrieval_mode": retrieval_mode,
+            "actr_diagnostic": None,
         }
         if results_dir:
             atomic_write_json(os.path.join(results_dir, f"result_{item_id}.json"), result)
@@ -503,12 +534,17 @@ def evaluate_single_item(
     if not memory_graph.nodes:
         raise RuntimeError("encoding_failure: empty memory graph")
 
-    # Load knowledge memory
-    kb_path = os.path.join(mem_dir, f"{item_id}_long_term.json")
-    knowledge_memory = HebbianKnowledgeMemory(file_path=kb_path)
+    graph_sha256_before = sha256_file(mem_path)
+
+    # Raw modes deliberately exclude semantic/profile/assistant long-term
+    # memory. Hebbian mode retains the historical pipeline unchanged.
+    knowledge_memory = None
+    if retrieval_mode == "hebbian":
+        kb_path = os.path.join(mem_dir, f"{item_id}_long_term.json")
+        knowledge_memory = HebbianKnowledgeMemory(file_path=kb_path)
 
     # Optional consolidation
-    if use_consolidation:
+    if use_consolidation and retrieval_mode == "hebbian":
         consolidate_memory(memory_graph, knowledge_memory)
 
     # Create retriever
@@ -518,10 +554,15 @@ def evaluate_single_item(
     try:
         retrieval_started = time.perf_counter()
         with llm_scope("other_calls", item_id):
-            generated_answer, retrieved, semantic_retrieved = answer_question(
+            generated_answer, retrieved, semantic_retrieved, actr_diagnostic = answer_question(
                 retriever, question, question_date, top_k=top_k,
                 knowledge_memory=knowledge_memory, semantic_top_k=semantic_top_k,
                 item_id=item_id,
+                retrieval_mode=retrieval_mode,
+                actr_candidate_k=actr_candidate_k,
+                actr_fan_threshold=actr_fan_threshold,
+                actr_score_mode=actr_score_mode,
+                actr_alpha=actr_alpha,
             )
         generation_seconds = time.perf_counter() - retrieval_started
     except Exception as e:
@@ -559,8 +600,10 @@ def evaluate_single_item(
         "num_retrieved": len(retrieved),
         "retrieved_episodic": compact_retrieval(retrieved),
         "retrieved_semantic": [{key: value for key, value in entry.items() if key != "knowledge_embedding"} for entry in semantic_retrieved],
-        "episodic_inhibition_trace": memory_graph.last_retrieval_trace,
-        "semantic_inhibition_trace": knowledge_memory.knowledge_graph.last_retrieval_trace,
+        "episodic_inhibition_trace": memory_graph.last_retrieval_trace if retrieval_mode == "hebbian" else None,
+        "semantic_inhibition_trace": knowledge_memory.knowledge_graph.last_retrieval_trace if knowledge_memory else None,
+        "retrieval_mode": retrieval_mode,
+        "actr_diagnostic": actr_diagnostic,
         "model": model_for("generation"),
         "judge_model": model_for("judge"),
         "status": "ok",
@@ -571,8 +614,18 @@ def evaluate_single_item(
         "eval_time": eval_time,
     }
 
-    # Persist retrieval-induced Hebbian updates before marking evaluation complete.
-    memory_graph.save()
+    # Only the historical Hebbian mode may persist retrieval-induced updates.
+    if retrieval_mode == "hebbian":
+        memory_graph.save()
+    graph_sha256_after = sha256_file(mem_path)
+    result["memory_graph_sha256_before"] = graph_sha256_before
+    result["memory_graph_sha256_after"] = graph_sha256_after
+    result["memory_graph_unchanged"] = graph_sha256_before == graph_sha256_after
+    if retrieval_mode != "hebbian" and not result["memory_graph_unchanged"]:
+        raise RuntimeError("read_only_violation: raw memory artifact changed during retrieval")
+
+    if results_dir and actr_diagnostic is not None:
+        atomic_write_json(os.path.join(results_dir, f"actr_diagnostic_{item_id}.json"), actr_diagnostic)
 
     # Save per-item result last; this is the resume completion marker.
     if results_dir:
@@ -598,6 +651,11 @@ def eval_longmemeval(
     workers: int = 20,
     results_dir: Optional[str] = None,
     resume: bool = True,
+    retrieval_mode: str = "hebbian",
+    actr_candidate_k: int = 30,
+    actr_fan_threshold: float = 0.5,
+    actr_score_mode: str = "actr",
+    actr_alpha: float = 0.5,
 ) -> None:
     """
     Run LongMemEval-S evaluation on encoded Hebbian memories.
@@ -620,6 +678,10 @@ def eval_longmemeval(
     print(f"top_k={top_k}, semantic_top_k={semantic_top_k}")
     print(f"Consolidation: {'ON' if use_consolidation else 'OFF'}")
     print(f"Workers: {workers}")
+    print(
+        f"Retrieval: mode={retrieval_mode}, candidate_k={actr_candidate_k}, "
+        f"fan_threshold={actr_fan_threshold}, score_mode={actr_score_mode}, alpha={actr_alpha}"
+    )
     print(f"Hebbian params: max_flipped={os.environ.get('HEBBIAN_MAX_FLIPPED', '5')}, "
           f"lr={os.environ.get('HEBBIAN_LEARNING_RATE', '0.02')}, "
           f"alpha={os.environ.get('HEBBIAN_ACTIVATION_ALPHA', '0.1')}, "
@@ -646,7 +708,10 @@ def eval_longmemeval(
     print(f"Evaluating items [{start_item}:{start_item + len(items)}]")
 
     # Create results directory
-    results_dir = results_dir or os.path.join(mem_dir, "eval_results")
+    result_label = retrieval_mode
+    if retrieval_mode == "actr" and actr_score_mode == "hybrid":
+        result_label = "actr_hybrid"
+    results_dir = results_dir or os.path.join(mem_dir, f"eval_results_{result_label}")
     os.makedirs(results_dir, exist_ok=True)
 
     # Evaluate items in parallel
@@ -659,6 +724,11 @@ def eval_longmemeval(
         "top_k": top_k,
         "semantic_top_k": semantic_top_k,
         "use_consolidation": use_consolidation,
+        "retrieval_mode": retrieval_mode,
+        "actr_candidate_k": actr_candidate_k,
+        "actr_fan_threshold": actr_fan_threshold,
+        "actr_score_mode": actr_score_mode,
+        "actr_alpha": actr_alpha,
         "use_inhibition": os.environ.get("HEBBIAN_USE_INHIBITION", "false").lower() == "true",
         "inhibition_beta": os.environ.get("HEBBIAN_INHIBITION_BETA", "0.15"),
         "inhibition_top_m": os.environ.get("HEBBIAN_INHIBITION_TOP_M", "7"),
@@ -678,7 +748,8 @@ def eval_longmemeval(
         else:
             pending.append((i, item))
     print(f"Evaluation resume: {len(all_results)} complete, {len(pending)} pending")
-    errors_path = Path(results_dir).parent / "errors.jsonl"
+    errors_name = "errors.jsonl" if retrieval_mode == "hebbian" else f"errors_{result_label}.jsonl"
+    errors_path = Path(results_dir).parent / errors_name
     errors_path.touch(exist_ok=True)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -693,6 +764,11 @@ def eval_longmemeval(
                 use_consolidation,
                 results_dir,
                 fingerprint,
+                retrieval_mode,
+                actr_candidate_k,
+                actr_fan_threshold,
+                actr_score_mode,
+                actr_alpha,
             ): start_item + i
             for i, item in pending
         }
@@ -775,6 +851,11 @@ def eval_longmemeval(
             "inhibition_top_m": os.environ.get("HEBBIAN_INHIBITION_TOP_M", "7"),
             "generation_model": model_for("generation"),
             "judge_model": model_for("judge"),
+            "retrieval_mode": retrieval_mode,
+            "actr_candidate_k": actr_candidate_k,
+            "actr_fan_threshold": actr_fan_threshold,
+            "actr_score_mode": actr_score_mode,
+            "actr_alpha": actr_alpha,
         },
         "results": all_results,
     }
@@ -784,22 +865,31 @@ def eval_longmemeval(
             "ppr_damping": os.environ.get("HEBBIAN_PPR_DAMPING", "0.5"),
             "ppr_top_n": os.environ.get("HEBBIAN_PPR_TOP_N", "10"),
         })
+    raw_diagnostics = [result["actr_diagnostic"] for result in all_results if result.get("actr_diagnostic")]
+    if retrieval_mode in {"raw", "cue_idf", "actr"}:
+        summary["actr_fan_summary"] = summarize_fans(raw_diagnostics)
+        summary["raw_graph_unchanged_all"] = all(
+            result.get("memory_graph_unchanged", False) for result in all_results if not result.get("is_corrupted")
+        )
+        atomic_write_json(Path(results_dir) / "actr_fan_summary.json", summary["actr_fan_summary"])
 
     summary_path = os.path.join(results_dir, "eval_summary.json")
     atomic_write_json(summary_path, summary)
-    predictions_path = Path(results_dir).parent / "predictions.jsonl"
+    suffix = "" if retrieval_mode == "hebbian" else f"_{result_label}"
+    predictions_path = Path(results_dir).parent / f"predictions{suffix}.jsonl"
     predictions_path.unlink(missing_ok=True)
     for result in all_results:
         append_jsonl(predictions_path, result)
-    atomic_write_json(Path(results_dir).parent / "metrics.json", {key: summary[key] for key in ("total_items", "total_correct", "overall_accuracy", "per_type")})
+    atomic_write_json(Path(results_dir).parent / f"metrics{suffix}.json", {key: summary[key] for key in ("total_items", "total_correct", "overall_accuracy", "per_type")})
     run_dir = Path(results_dir).parent
     eval_usage = usage_snapshot()
-    atomic_write_json(run_dir / "eval_llm_usage.json", eval_usage)
+    atomic_write_json(run_dir / f"eval_llm_usage{suffix}.json", eval_usage)
     encode_usage = read_valid_json(run_dir / "encode_llm_usage.json") or {}
-    atomic_write_json(run_dir / "llm_usage.json", {"encode": encode_usage, "eval": eval_usage})
+    atomic_write_json(run_dir / f"llm_usage{suffix}.json", {"encode": encode_usage, "eval": eval_usage})
     old_timing = read_valid_json(run_dir / "timing.json") or {}
     eval_seconds = sum(float(result.get("eval_time", 0.0)) for result in all_results)
-    atomic_write_json(run_dir / "timing.json", old_timing | {"eval_time": eval_seconds, "total_time": float(old_timing.get("encode_time", 0.0)) + eval_seconds, "avg_eval_time_per_item": eval_seconds / max(len(all_results), 1)})
+    timing_name = "timing.json" if retrieval_mode == "hebbian" else f"timing_{result_label}.json"
+    atomic_write_json(run_dir / timing_name, old_timing | {"eval_time": eval_seconds, "total_time": float(old_timing.get("encode_time", 0.0)) + eval_seconds, "avg_eval_time_per_item": eval_seconds / max(len(all_results), 1)})
     print(f"Summary saved: {summary_path}")
 
 
@@ -838,8 +928,21 @@ def main() -> None:
     parser.add_argument("--ppr-expand", action="store_true")
     parser.add_argument("--ppr-damping", type=float, default=0.5)
     parser.add_argument("--ppr-top-n", type=int, default=10)
+    parser.add_argument(
+        "--retrieval_mode", "--retrieval-mode", choices=("hebbian", "raw", "cue_idf", "actr"),
+        default="hebbian",
+    )
+    parser.add_argument("--actr_candidate_k", "--actr-candidate-k", type=int, default=30)
+    parser.add_argument("--actr_fan_threshold", "--actr-fan-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--actr_score_mode", "--actr-score-mode", choices=("actr", "hybrid"), default="actr"
+    )
+    parser.add_argument("--actr_alpha", "--actr-alpha", type=float, default=0.5)
 
     args = parser.parse_args()
+
+    if args.retrieval_mode != "hebbian" and args.use_consolidation:
+        parser.error("--use_consolidation is only valid for retrieval_mode=hebbian")
 
     top_k = args.top_k or int(os.environ.get("HEBBIAN_TOP_K", "20"))
     os.environ["HEBBIAN_USE_INHIBITION"] = str(args.use_inhibition).lower()
@@ -860,6 +963,11 @@ def main() -> None:
         workers=args.workers,
         results_dir=args.results_dir,
         resume=not args.no_resume,
+        retrieval_mode=args.retrieval_mode,
+        actr_candidate_k=args.actr_candidate_k,
+        actr_fan_threshold=args.actr_fan_threshold,
+        actr_score_mode=args.actr_score_mode,
+        actr_alpha=args.actr_alpha,
     )
 
 
