@@ -80,7 +80,7 @@ The LongMemEval pipeline has independent model controls so answer generation,
 memory extraction, and judging can be changed without coupling protocols:
 
 ```bash
-export OPENAI_BASE_URL="http://127.0.0.1:8000/v1"
+export OPENAI_BASE_URL="http://127.0.0.1:18000/v1"
 export OPENAI_API_KEY="EMPTY"
 export HEBBIAN_GENERATION_MODEL="Qwen3-4B-Instruct-2507"
 export HEBBIAN_EXTRACTION_MODEL="Qwen3-4B-Instruct-2507"
