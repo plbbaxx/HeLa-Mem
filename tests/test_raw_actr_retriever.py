@@ -1,6 +1,7 @@
 import copy
 import json
 import sys
+import tempfile
 import types
 import unittest
 
@@ -92,7 +93,7 @@ class RawACTRRetrieverTest(unittest.TestCase):
             "memory_bank_size": 10,
             "cues": [{"fan": 1}, {"fan": 7}],
         }])
-        self.assertEqual(summary["fan_histogram"], {"1": 1, "7": 1})
+        self.assertEqual(summary["raw_fan_histogram"], {"1": 1, "7": 1})
         self.assertEqual(summary["high_fan_cue_rate"], 0.5)
         self.assertEqual(summary["low_fan_cue_rate"], 0.5)
 
@@ -102,6 +103,46 @@ class RawACTRRetrieverTest(unittest.TestCase):
                 {"type": "relation", "text": "Alice"},
                 {"type": "time", "text": "2024"},
             ]}), "Where did Alice move in 2024?")
+
+    def test_zero_raw_fan_is_distinguished_from_effective_fan(self):
+        retriever = RawACTRRetriever(
+            self.graph,
+            lambda query: [{"type": "relation", "text": "broad cue"}],
+            self.embedding,
+        )
+        retriever.retrieve("question", mode="actr", candidate_k=2, top_k=2, fan_threshold=1.0)
+        cue = retriever.last_diagnostic["cues"][0]
+        self.assertEqual(cue["raw_fan"], 0)
+        self.assertEqual(cue["effective_fan"], 1)
+
+    def test_cue_cache_is_reused_across_retrievers(self):
+        calls = []
+        extractor = lambda query: calls.append(query) or [{"type": "event", "text": "relation cue"}]
+        with tempfile.TemporaryDirectory() as directory:
+            first = RawACTRRetriever(self.graph, extractor, self.embedding, cue_cache_dir=directory)
+            first.retrieve("question", mode="cue_idf", candidate_k=2, top_k=2, question_id="q1")
+            second = RawACTRRetriever(self.graph, extractor, self.embedding, cue_cache_dir=directory)
+            second.retrieve("question", mode="actr", candidate_k=2, top_k=2, question_id="q1")
+        self.assertEqual(calls, ["question"])
+        self.assertEqual(first.last_diagnostic["cue_source"], "generated_and_cached")
+        self.assertEqual(second.last_diagnostic["cue_source"], "cache")
+
+    def test_activation_ties_fall_back_to_raw_rank(self):
+        retriever = RawACTRRetriever(
+            self.graph,
+            lambda query: [{"type": "relation", "text": "relation cue"}],
+            self.embedding,
+        )
+        results = retriever.retrieve(
+            "question", mode="actr", candidate_k=4, top_k=4, fan_threshold=1.0,
+        )
+        diagnostic = retriever.last_diagnostic
+        # All but exact matches can tie; tied items retain their coarse Raw order.
+        tied = [row for row in diagnostic["candidates"] if row["actr_activation"] == 0]
+        self.assertEqual(
+            [row["node_id"] for row in sorted(tied, key=lambda row: row["actr_rank"])],
+            [row["node_id"] for row in tied],
+        )
 
 
 if __name__ == "__main__":

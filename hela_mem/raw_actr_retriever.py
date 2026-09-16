@@ -5,13 +5,18 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
+from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from .runtime import chat_extra_body, llm_scope, model_for, record_llm_request, record_llm_usage, strip_reasoning
+from .runtime import atomic_write_json, chat_extra_body, llm_scope, model_for, record_llm_request, record_llm_usage, strip_reasoning
 from .utils import _create_client, get_embedding, normalize_vector
+
+
+_cue_cache_lock = threading.Lock()
 
 
 CUE_PROMPT = """You extract relation-aware retrieval cues from a question.
@@ -100,11 +105,32 @@ class RawACTRRetriever:
         memory_graph: Any,
         cue_extractor: Callable[[str], list[dict[str, str]]] = extract_relational_cues,
         embedding_fn: Callable[[str], Any] = get_embedding,
+        cue_cache_dir: str | Path | None = None,
     ) -> None:
         self._nodes: Mapping[str, Mapping[str, Any]] = memory_graph.nodes
         self._cue_extractor = cue_extractor
         self._embedding_fn = embedding_fn
+        self._cue_cache_dir = Path(cue_cache_dir) if cue_cache_dir else None
         self.last_diagnostic: dict[str, Any] | None = None
+
+    def _get_cues(self, query: str, question_id: str) -> tuple[list[dict[str, str]], str]:
+        if self._cue_cache_dir is None or not question_id:
+            return self._cue_extractor(query), "generated_uncached"
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", question_id)
+        path = self._cue_cache_dir / f"{safe_id}.json"
+        with _cue_cache_lock:
+            if path.exists():
+                try:
+                    cached = json.loads(path.read_text(encoding="utf-8"))
+                    if cached.get("question_id") == question_id and cached.get("question") == query:
+                        cues = cached.get("cues")
+                        if isinstance(cues, list) and cues:
+                            return cues, "cache"
+                except (OSError, ValueError, TypeError):
+                    pass
+            cues = self._cue_extractor(query)
+            atomic_write_json(path, {"question_id": question_id, "question": query, "cues": cues})
+            return cues, "generated_and_cached"
 
     def retrieve(
         self,
@@ -145,7 +171,7 @@ class RawACTRRetriever:
 
         # Raw is deliberately a clean whole-query cosine baseline and makes no
         # cue-extraction LLM call.
-        cues = [] if mode == "raw" else self._cue_extractor(query)
+        cues, cue_source = ([], "not_used") if mode == "raw" else self._get_cues(query, question_id)
         cue_rows = []
         candidate_associations = np.zeros((len(cues), len(candidate_indices)), dtype=float)
         actr_activation = np.zeros(len(candidate_indices), dtype=float)
@@ -156,8 +182,9 @@ class RawACTRRetriever:
         for cue_index, cue in enumerate(cues):
             cue_vec = normalize_vector(self._embedding_fn(cue["text"]))
             all_associations = memory_matrix @ cue_vec
-            fan = max(1, int(np.count_nonzero(all_associations >= fan_threshold)))
-            fan_strength = s_max - math.log(fan)
+            raw_fan = int(np.count_nonzero(all_associations >= fan_threshold))
+            effective_fan = max(1, raw_fan)
+            fan_strength = s_max - math.log(effective_fan)
             candidate_values = all_associations[candidate_indices]
             gates = (candidate_values >= fan_threshold).astype(float)
             candidate_associations[cue_index] = candidate_values
@@ -168,7 +195,9 @@ class RawACTRRetriever:
             cue_rows.append({
                 "type": cue.get("type", "relation"),
                 "text": cue["text"],
-                "fan": fan,
+                "fan": effective_fan,
+                "raw_fan": raw_fan,
+                "effective_fan": effective_fan,
                 "source_activation": source_activation,
                 "fan_strength": fan_strength,
             })
@@ -185,14 +214,14 @@ class RawACTRRetriever:
 
         final_order = sorted(
             range(len(candidate_ids)),
-            key=lambda index: (-float(final_scores[index]), candidate_indices[index], candidate_ids[index]),
+            key=lambda index: (-float(final_scores[index]), index, candidate_ids[index]),
         )
         selected_positions = final_order[: min(top_k, len(final_order))]
         raw_selected = set(range(min(top_k, len(candidate_ids))))
         final_selected = set(selected_positions)
         actr_order = sorted(
             range(len(candidate_ids)),
-            key=lambda index: (-float(actr_activation[index]), candidate_indices[index], candidate_ids[index]),
+            key=lambda index: (-float(actr_activation[index]), index, candidate_ids[index]),
         )
         actr_rank = {position: rank for rank, position in enumerate(actr_order, start=1)}
         final_rank = {position: rank for rank, position in enumerate(final_order, start=1)}
@@ -233,6 +262,7 @@ class RawACTRRetriever:
             "memory_bank_size": bank_size,
             "coarse_candidate_ids": candidate_ids,
             "fan_computed_over_memory_count": bank_size,
+            "cue_source": cue_source,
             "cues": cue_rows,
             "candidates": candidates,
         }
@@ -256,34 +286,40 @@ class RawACTRRetriever:
             "candidate_k": candidate_k, "final_k": top_k, "fan_threshold": threshold,
             "score_mode": score_mode, "alpha": alpha, "memory_bank_size": 0,
             "coarse_candidate_ids": [], "fan_computed_over_memory_count": 0,
-            "cues": [], "candidates": [],
+            "cue_source": "not_used", "cues": [], "candidates": [],
         }
 
 
 def summarize_fans(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
     cues = [cue for diagnostic in diagnostics for cue in diagnostic.get("cues", [])]
-    fans = [int(cue["fan"]) for cue in cues]
+    raw_fans = [int(cue.get("raw_fan", cue["fan"])) for cue in cues]
+    effective_fans = [int(cue.get("effective_fan", cue["fan"])) for cue in cues]
     question_count = len(diagnostics)
-    histogram = {str(value): fans.count(value) for value in sorted(set(fans))}
+    raw_histogram = {str(value): raw_fans.count(value) for value in sorted(set(raw_fans))}
+    effective_histogram = {str(value): effective_fans.count(value) for value in sorted(set(effective_fans))}
     high = 0
     low = 0
     for diagnostic in diagnostics:
         size = max(1, int(diagnostic.get("memory_bank_size", 0)))
         for cue in diagnostic.get("cues", []):
-            ratio = cue["fan"] / size
+            ratio = cue.get("raw_fan", cue["fan"]) / size
             high += ratio >= 0.5
             low += ratio <= 0.1
     return {
         "question_count": question_count,
         "cue_count": len(cues),
         "average_cue_count": len(cues) / question_count if question_count else 0.0,
-        "average_fan": sum(fans) / len(fans) if fans else 0.0,
-        "median_fan": median(fans) if fans else 0.0,
-        "min_fan": min(fans, default=0),
-        "max_fan": max(fans, default=0),
+        "average_raw_fan": sum(raw_fans) / len(raw_fans) if raw_fans else 0.0,
+        "median_raw_fan": median(raw_fans) if raw_fans else 0.0,
+        "min_raw_fan": min(raw_fans, default=0),
+        "max_raw_fan": max(raw_fans, default=0),
+        "zero_raw_fan_count": sum(value == 0 for value in raw_fans),
+        "zero_raw_fan_rate": sum(value == 0 for value in raw_fans) / len(raw_fans) if raw_fans else 0.0,
+        "average_effective_fan": sum(effective_fans) / len(effective_fans) if effective_fans else 0.0,
         "high_fan_definition": "fan / memory_bank_size >= 0.5",
         "low_fan_definition": "fan / memory_bank_size <= 0.1",
         "high_fan_cue_rate": high / len(cues) if cues else 0.0,
         "low_fan_cue_rate": low / len(cues) if cues else 0.0,
-        "fan_histogram": histogram,
+        "raw_fan_histogram": raw_histogram,
+        "effective_fan_histogram": effective_histogram,
     }

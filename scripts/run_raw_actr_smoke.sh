@@ -26,7 +26,8 @@ case "$MODE" in raw|cue_idf|actr) ;; *) echo "mode must be raw, cue_idf, or actr
 LABEL="$MODE"
 if [[ "$MODE" == "actr" ]]; then LABEL="actr_${SCORE_MODE}"; fi
 RESULTS_DIR="${OUTPUT_ROOT}/eval_results_${LABEL}"
-mkdir -p "$RESULTS_DIR"
+CUE_CACHE_DIR="${OUTPUT_ROOT}/cue_cache"
+mkdir -p "$RESULTS_DIR" "$CUE_CACHE_DIR"
 
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://127.0.0.1:18000/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}"
@@ -47,4 +48,7 @@ python -m hela_mem.eval_longmemeval \
   --actr_candidate_k 30 \
   --actr_fan_threshold 0.5 \
   --actr_score_mode "$SCORE_MODE" \
-  --actr_alpha 0.5
+  --actr_alpha 0.5 \
+  --actr_cue_cache_dir "$CUE_CACHE_DIR" \
+  --generation_temperature 0 \
+  --judge_temperature 0

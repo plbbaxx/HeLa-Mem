@@ -192,7 +192,7 @@ def llm_extract_keywords(text, client=None):
     return set(keywords)
 
 
-def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=3, role="generation"):
+def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=3, role="generation", temperature=0.7):
     """
     Generate answer using LLM with API key rotation.
     Thread-safe: creates a new client with rotated API key for each call.
@@ -209,7 +209,7 @@ def gpt_generate_answer_with_rotation(prompt, messages, model=None, max_retries=
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
-                temperature=0.7,
+                temperature=temperature,
                 max_tokens=2000,
                 **chat_extra_body(),
             )

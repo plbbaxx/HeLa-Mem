@@ -35,6 +35,9 @@ def analyze(raw, cue_idf, actr, hybrid) -> dict[str, Any]:
     fan_scope_failures = []
     strength_failures = []
     ranking_changes = []
+    selection_changes = []
+    cue_mismatches = []
+    all_zero_activation_questions = []
     for question_id in sorted(sets[0]):
         rows = {"raw": raw[question_id], "cue_idf": cue_idf[question_id], "actr": actr[question_id], "hybrid": hybrid[question_id]}
         diagnostics = {name: row["actr_diagnostic"] for name, row in rows.items()}
@@ -54,9 +57,21 @@ def analyze(raw, cue_idf, actr, hybrid) -> dict[str, Any]:
                         strength_failures.append(f"{question_id}:{name}")
         raw_top = selected_ids(diagnostics["raw"])
         actr_top = selected_ids(diagnostics["actr"])
+        cue_texts = {
+            name: tuple(cue["text"] for cue in diagnostics[name]["cues"])
+            for name in ("cue_idf", "actr", "hybrid")
+        }
+        if len(set(cue_texts.values())) != 1:
+            cue_mismatches.append(question_id)
         changed = raw_top != actr_top
         if changed:
             ranking_changes.append(question_id)
+        if set(raw_top) != set(actr_top):
+            selection_changes.append(question_id)
+        if diagnostics["actr"]["candidates"] and all(
+            candidate["actr_activation"] == 0 for candidate in diagnostics["actr"]["candidates"]
+        ):
+            all_zero_activation_questions.append(question_id)
         records.append({
             "question_id": question_id,
             "question": diagnostics["actr"]["question"],
@@ -86,6 +101,10 @@ def analyze(raw, cue_idf, actr, hybrid) -> dict[str, Any]:
         "low_fan_has_stronger_activation": not strength_failures,
         "fan_strength_failures": sorted(set(strength_failures)),
         "ranking_changed_questions": ranking_changes,
+        "selection_changed_questions": selection_changes,
+        "cue_sequences_identical_across_methods": not cue_mismatches,
+        "cue_sequence_mismatch_questions": cue_mismatches,
+        "all_zero_activation_questions": all_zero_activation_questions,
         "first_ranking_changed_case": next((row for row in records if row["ranking_changed"]), None),
         "cue_review_records": records[:10],
     }

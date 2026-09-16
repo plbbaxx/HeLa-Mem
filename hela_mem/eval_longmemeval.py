@@ -367,6 +367,8 @@ def answer_question(
     actr_fan_threshold: float = 0.5,
     actr_score_mode: str = "actr",
     actr_alpha: float = 0.5,
+    actr_cue_cache_dir: Optional[str] = None,
+    generation_temperature: float = 0.7,
 ) -> Tuple[str, list, list, Optional[dict]]:
     """
     Answer a single LongMemEval question using Hebbian retrieval.
@@ -380,7 +382,7 @@ def answer_question(
     if retrieval_mode == "hebbian":
         results = retriever.graph.retrieve(question, top_k=top_k)
     else:
-        raw_retriever = RawACTRRetriever(retriever.graph)
+        raw_retriever = RawACTRRetriever(retriever.graph, cue_cache_dir=actr_cue_cache_dir)
         results = raw_retriever.retrieve(
             query=question,
             mode=retrieval_mode,
@@ -454,7 +456,12 @@ def answer_question(
     ]
 
     with llm_scope("answer_generation_calls"):
-        response = gpt_generate_answer_with_rotation(user_prompt, messages, role="generation")
+        if generation_temperature == 0.7:
+            response = gpt_generate_answer_with_rotation(user_prompt, messages, role="generation")
+        else:
+            response = gpt_generate_answer_with_rotation(
+                user_prompt, messages, role="generation", temperature=generation_temperature
+            )
     return response, results, kb_results, raw_diagnostic
 
 
@@ -474,6 +481,9 @@ def evaluate_single_item(
     actr_fan_threshold: float = 0.5,
     actr_score_mode: str = "actr",
     actr_alpha: float = 0.5,
+    actr_cue_cache_dir: Optional[str] = None,
+    generation_temperature: float = 0.7,
+    judge_temperature: float = 0.7,
 ) -> Dict[str, Any]:
     """
     Evaluate a single LongMemEval item.
@@ -563,6 +573,8 @@ def evaluate_single_item(
                 actr_fan_threshold=actr_fan_threshold,
                 actr_score_mode=actr_score_mode,
                 actr_alpha=actr_alpha,
+                actr_cue_cache_dir=actr_cue_cache_dir,
+                generation_temperature=generation_temperature,
             )
         generation_seconds = time.perf_counter() - retrieval_started
     except Exception as e:
@@ -577,7 +589,12 @@ def evaluate_single_item(
         judge_messages = [{"role": "user", "content": judge_prompt}]
         judge_started = time.perf_counter()
         with llm_scope("judge_calls", item_id):
-            judge_response = gpt_generate_answer_with_rotation(judge_prompt, judge_messages, role="judge")
+            if judge_temperature == 0.7:
+                judge_response = gpt_generate_answer_with_rotation(judge_prompt, judge_messages, role="judge")
+            else:
+                judge_response = gpt_generate_answer_with_rotation(
+                    judge_prompt, judge_messages, role="judge", temperature=judge_temperature
+                )
         correct = 1 if parse_judge_response(judge_response) else 0
         judge_seconds = time.perf_counter() - judge_started
     except Exception as e:
@@ -656,6 +673,9 @@ def eval_longmemeval(
     actr_fan_threshold: float = 0.5,
     actr_score_mode: str = "actr",
     actr_alpha: float = 0.5,
+    actr_cue_cache_dir: Optional[str] = None,
+    generation_temperature: float = 0.7,
+    judge_temperature: float = 0.7,
 ) -> None:
     """
     Run LongMemEval-S evaluation on encoded Hebbian memories.
@@ -682,6 +702,7 @@ def eval_longmemeval(
         f"Retrieval: mode={retrieval_mode}, candidate_k={actr_candidate_k}, "
         f"fan_threshold={actr_fan_threshold}, score_mode={actr_score_mode}, alpha={actr_alpha}"
     )
+    print(f"Temperatures: generation={generation_temperature}, judge={judge_temperature}")
     print(f"Hebbian params: max_flipped={os.environ.get('HEBBIAN_MAX_FLIPPED', '5')}, "
           f"lr={os.environ.get('HEBBIAN_LEARNING_RATE', '0.02')}, "
           f"alpha={os.environ.get('HEBBIAN_ACTIVATION_ALPHA', '0.1')}, "
@@ -729,6 +750,9 @@ def eval_longmemeval(
         "actr_fan_threshold": actr_fan_threshold,
         "actr_score_mode": actr_score_mode,
         "actr_alpha": actr_alpha,
+        "actr_cue_cache_dir": actr_cue_cache_dir,
+        "generation_temperature": generation_temperature,
+        "judge_temperature": judge_temperature,
         "use_inhibition": os.environ.get("HEBBIAN_USE_INHIBITION", "false").lower() == "true",
         "inhibition_beta": os.environ.get("HEBBIAN_INHIBITION_BETA", "0.15"),
         "inhibition_top_m": os.environ.get("HEBBIAN_INHIBITION_TOP_M", "7"),
@@ -769,6 +793,9 @@ def eval_longmemeval(
                 actr_fan_threshold,
                 actr_score_mode,
                 actr_alpha,
+                actr_cue_cache_dir,
+                generation_temperature,
+                judge_temperature,
             ): start_item + i
             for i, item in pending
         }
@@ -856,6 +883,9 @@ def eval_longmemeval(
             "actr_fan_threshold": actr_fan_threshold,
             "actr_score_mode": actr_score_mode,
             "actr_alpha": actr_alpha,
+            "actr_cue_cache_dir": actr_cue_cache_dir,
+            "generation_temperature": generation_temperature,
+            "judge_temperature": judge_temperature,
         },
         "results": all_results,
     }
@@ -938,6 +968,9 @@ def main() -> None:
         "--actr_score_mode", "--actr-score-mode", choices=("actr", "hybrid"), default="actr"
     )
     parser.add_argument("--actr_alpha", "--actr-alpha", type=float, default=0.5)
+    parser.add_argument("--actr_cue_cache_dir", "--actr-cue-cache-dir", default=None)
+    parser.add_argument("--generation_temperature", "--generation-temperature", type=float, default=0.7)
+    parser.add_argument("--judge_temperature", "--judge-temperature", type=float, default=0.7)
 
     args = parser.parse_args()
 
@@ -968,6 +1001,9 @@ def main() -> None:
         actr_fan_threshold=args.actr_fan_threshold,
         actr_score_mode=args.actr_score_mode,
         actr_alpha=args.actr_alpha,
+        actr_cue_cache_dir=args.actr_cue_cache_dir,
+        generation_temperature=args.generation_temperature,
+        judge_temperature=args.judge_temperature,
     )
 
 
